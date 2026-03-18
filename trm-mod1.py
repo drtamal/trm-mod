@@ -22,6 +22,21 @@ from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from datasets import load_dataset
 from tqdm import tqdm
 
+#-----AUTO RESUME-----------------------
+
+def get_latest_checkpoint(output_dir):
+    if not os.path.exists(output_dir):
+        return None, 0
+
+    ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
+    if len(ckpts) == 0:
+        return None, 0
+
+    latest = sorted(ckpts, key=lambda x: int(x.split("-")[-1]))[-1]
+    step = int(latest.split("-")[-1])
+
+    return os.path.join(output_dir, latest), step
+
 # ── Reproducibility ──────────────────────────────────────────────
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -297,14 +312,14 @@ class EMA:
             if n in self.backup: p.data.copy_(self.backup[n])
 
 
-def train_stream(model, ema, tokenizer, loader, optimizer, scheduler, cfg):
+def train_stream(model, ema, tokenizer, loader, optimizer, scheduler, cfg, start_step=0):
     model.train()
     optimizer.zero_grad()
     
-    pbar = tqdm(loader, total=cfg.max_steps * cfg.gradient_accumulation_steps, desc="Training")
-    
+    #pbar = tqdm(loader, total=cfg.max_steps * cfg.gradient_accumulation_steps, desc="Training")
+    pbar = tqdm(loader, total=(cfg.max_steps - start_step) * cfg.gradient_accumulation_steps, desc="Training")
     batch_lm_accum = 0.0
-    optim_step = 0
+    optim_step = start_step
     
     for i, batch in enumerate(pbar):
         ids, labels, mask = batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device), batch["attention_mask"].to(cfg.device)
@@ -326,17 +341,26 @@ def train_stream(model, ema, tokenizer, loader, optimizer, scheduler, cfg):
                 y_out, z_out, logits, q = model._deep_recursion(x, y_in, z_in, mask)
                 loss, lm_val = model.compute_loss(logits, q, labels)
                 scaled_loss = loss / cfg.gradient_accumulation_steps
-            
+
+            # ✅ ADD HERE
+            if torch.isnan(q).any() or torch.isinf(q).any() or torch.isnan(loss) or torch.isinf(loss):
+                print("[WARNING] NaN/INF detected — skipping batch")
+                optimizer.zero_grad()
+                break   # ← VERY IMPORTANT
+
+            #scaled_loss.backward()
             scaled_loss.backward()
             
             y, z = y_out.detach(), z_out.detach()
             batch_lm += lm_val
             steps_taken += 1
 
-            if torch.sigmoid(q).mean() > 0.9: 
+            if torch.sigmoid(q.clamp(-10, 10)).mean() > 0.9: 
                 break
         
-        batch_lm_accum += (batch_lm / steps_taken)
+        #batch_lm_accum += (batch_lm / steps_taken)
+        if steps_taken > 0:
+            batch_lm_accum += (batch_lm / steps_taken)
         
         # Optimizer Step
         if (i + 1) % cfg.gradient_accumulation_steps == 0:
@@ -431,12 +455,48 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     sched = get_cosine_schedule_with_warmup(opt, cfg.warmup_steps, cfg.max_steps)
 
+    #-----------------------------------------AUTO RESUME
+
+    output_dir = cfg.output_dir
+
+    checkpoint_path, start_step = get_latest_checkpoint(output_dir)
+
+    if checkpoint_path is not None:
+        print(f"[INFO] Resuming from {checkpoint_path}")
+
+        ckpt_file = os.path.join(checkpoint_path, "trm_model.pt")
+
+        if os.path.exists(ckpt_file):
+            try:
+                ckpt = torch.load(ckpt_file, map_location=cfg.device)
+
+                model.load_state_dict(ckpt["model_state_dict"])
+                opt.load_state_dict(ckpt["optimizer_state_dict"])
+                sched.load_state_dict(ckpt["scheduler_state_dict"])
+
+                start_step = ckpt.get("step", start_step)
+
+                print(f"[INFO] Successfully loaded checkpoint at step {start_step}")
+
+            except Exception as e:
+                print(f"[WARNING] Failed to load checkpoint: {e}")
+                print("[INFO] Starting from scratch.")
+                start_step = 0
+        else:
+            print("[WARNING] Checkpoint file missing. Starting fresh.")
+            start_step = 0
+    else:
+        print("[INFO] No checkpoint found. Starting fresh.")
+        start_step = 0
+
+#----------------------------------------------------
+
     print(f"\n🚀 Starting continuous streaming training for {cfg.max_steps} optimization steps...")
     
     # Create the root output directory if it doesn't exist
     os.makedirs(cfg.output_dir, exist_ok=True)
     
-    train_stream(model, ema, tokenizer, loader, opt, sched, cfg)
+    train_stream(model, ema, tokenizer, loader, opt, sched, cfg, start_step=start_step)
 
 if __name__ == "__main__":  # Fixed: __name__ and __main__
     main()
