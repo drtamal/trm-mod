@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TRM-LM: Tiny Recursive Model for Generative Language Modeling
-Fully Resumable Version with EMA State and Dataset Fast-Forwarding.
+Optimized for L40S (48GB VRAM) - High Throughput, No Checkpointing.
 """
 import os
 import math
@@ -44,24 +44,30 @@ class TRMConfig:
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-5
     tie_word_embeddings: bool = True
+    
     n_latent: int = 6
     T_recurse: int = 3
     N_sup: int = 16
     inference_N_sup: int = 4
     ema_decay: float = 0.999
+    
     tokenizer_name: str = "HuggingFaceTB/SmolLM-135M"
     dataset_name: str = "HuggingFaceFW/fineweb-edu"
     dataset_subset: str = "sample-10BT"
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 32
+
+    # --- L40S OPTIMIZED SETTINGS ---
+    batch_size: int = 16               # Increased from 2 (L40S has 48GB!)
+    gradient_accumulation_steps: int = 4  # Adjusted to keep global batch similar
+    max_seq_length: int = 512          # Increased context length
+    use_gradient_checkpointing: bool = False # DISABLED: Fixes the CheckpointError
+    # -------------------------------
+
     learning_rate: float = 5e-4
     weight_decay: float = 0.1
     max_grad_norm: float = 1.0
     warmup_steps: int = 1000
     max_steps: int = 50000
     save_interval: int = 1000
-    max_seq_length: int = 256
-    use_gradient_checkpointing: bool = True
     use_mixed_precision: bool = True
     output_dir: str = "./output_trm"
     seed: int = 42
@@ -145,14 +151,11 @@ class TinyRecursiveNet(nn.Module):
         super().__init__()
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
         self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.use_checkpoint = cfg.use_gradient_checkpointing
 
     def forward(self, h, mask=None):
         for block in self.blocks:
-            if self.use_checkpoint and self.training and torch.is_grad_enabled():
-                h = torch.utils.checkpoint.checkpoint(block, h, mask, use_reentrant=False)
-            else:
-                h = block(h, mask)
+            # Checkpointing removed to fix Metadata Mismatch on L40S
+            h = block(h, mask)
         return self.final_norm(h)
 
 class TRMForCausalLM(nn.Module):
@@ -260,7 +263,6 @@ def train_stream(model, ema, tokenizer, loader, optimizer, scheduler, cfg, start
     model.train()
     optimizer.zero_grad()
     
-    # Fast-forward calculation
     skip_batches = start_step * cfg.gradient_accumulation_steps
     pbar = tqdm(loader, total=cfg.max_steps * cfg.gradient_accumulation_steps, desc="Training")
     
@@ -268,9 +270,8 @@ def train_stream(model, ema, tokenizer, loader, optimizer, scheduler, cfg, start
     optim_step = start_step
 
     for i, batch in enumerate(pbar):
-        # 1. Dataset Fast-Forwarding
         if i < skip_batches:
-            if i % 100 == 0: pbar.set_description(f"Skipping {i}/{skip_batches}")
+            if i % 1000 == 0: pbar.set_description(f"Fast-forwarding dataset: {i}/{skip_batches}")
             continue
 
         ids, labels, mask = batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device), batch["attention_mask"].to(cfg.device)
@@ -290,7 +291,7 @@ def train_stream(model, ema, tokenizer, loader, optimizer, scheduler, cfg, start
                 scaled_loss = loss / cfg.gradient_accumulation_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
-                print("[WARNING] NaN detected, skipping.")
+                print("[WARNING] NaN/Inf detected, skipping batch.")
                 optimizer.zero_grad()
                 break
 
@@ -337,10 +338,10 @@ def save_checkpoint(model, ema, optimizer, scheduler, step, loss, tokenizer, cfg
     }, ckpt_path)
     
     tokenizer.save_pretrained(save_dir)
-    print(f"\n✅ Checkpoint saved: {ckpt_path}")
+    print(f"\n✅ Weights physically saved to: {ckpt_path}")
     ema.restore(model)
 
-# ── Main ─────────────────────────────────────────────────────────
+# ── Main Runner ───────────────────────────────────────────────────
 class FinewebEduStreamingDataset(IterableDataset):
     def __init__(self, tokenizer, max_len, subset, split="train"):
         super().__init__()
@@ -369,22 +370,23 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     sched = get_cosine_schedule_with_warmup(opt, cfg.warmup_steps, cfg.max_steps)
 
-    # Resume Logic
+    # Auto-Resume Logic
     ckpt_path, start_step = get_latest_checkpoint(cfg.output_dir)
     if ckpt_path:
-        print(f"Resuming from {ckpt_path}...")
+        print(f"--- [RESTART DETECTED] Resuming from step {start_step} ---")
         ckpt = torch.load(os.path.join(ckpt_path, "trm_model.pt"), map_location=cfg.device)
         model.load_state_dict(ckpt["model_state_dict"])
         opt.load_state_dict(ckpt["optimizer_state_dict"])
         sched.load_state_dict(ckpt["scheduler_state_dict"])
         if "ema_shadow" in ckpt:
             ema.shadow = ckpt["ema_shadow"]
-        start_step = ckpt["step"]
+        start_step = ckpt.get("step", start_step)
 
     train_ds = FinewebEduStreamingDataset(tokenizer, cfg.max_seq_length, cfg.dataset_subset)
     loader = DataLoader(train_ds, batch_size=cfg.batch_size)
     
     os.makedirs(cfg.output_dir, exist_ok=True)
+    print(f"🚀 Training starting on {cfg.device}. Global batch: {cfg.batch_size * cfg.gradient_accumulation_steps}")
     train_stream(model, ema, tokenizer, loader, opt, sched, cfg, start_step=start_step)
 
 if __name__ == "__main__":
