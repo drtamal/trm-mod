@@ -176,4 +176,65 @@ class FinewebStream(IterableDataset):
         for x in self.ds.shuffle(buffer_size=1000, seed=self.cfg.seed):
             e = self.tokenizer(x["text"] + self.tokenizer.eos_token, max_length=self.cfg.max_seq_length, padding="max_length", truncation=True, return_tensors="pt")
             out = {k: v.squeeze(0) for k, v in e.items()}
-            out["labels
+            out["labels"] = out["input_ids"].clone()
+            out["labels"][out["attention_mask"] == 0] = -100
+            yield out
+
+def main():
+    cfg = TRMConfig()
+    set_seed(cfg.seed)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    model = TRMForCausalLM(cfg, len(tokenizer)).to(cfg.device)
+    ema = EMA(model, cfg.ema_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    sched = get_cosine_schedule_with_warmup(opt, cfg.warmup_steps, cfg.max_steps)
+
+    ckpt_path, start_step = get_latest_checkpoint(cfg.output_dir)
+    if ckpt_path:
+        print(f"Resuming from {ckpt_path} at step {start_step}...")
+        ckpt = torch.load(os.path.join(ckpt_path, "trm_model.pt"), map_location=cfg.device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        opt.load_state_dict(ckpt["optimizer_state_dict"])
+        sched.load_state_dict(ckpt["scheduler_state_dict"])
+        if ckpt.get("ema_shadow"): ema.shadow = ckpt["ema_shadow"]
+
+    loader = DataLoader(FinewebStream(tokenizer, cfg), batch_size=cfg.batch_size)
+    pbar = tqdm(loader, total=cfg.max_steps, initial=start_step)
+    optim_step, accum_loss = start_step, 0
+    
+    skip_batches = start_step * cfg.gradient_accumulation_steps
+    model.train()
+    
+    for i, batch in enumerate(pbar):
+        if i < skip_batches: continue
+        
+        input_ids, labels, mask = batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device), batch["attention_mask"].to(cfg.device)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss, _ = model(input_ids, labels, mask)
+            loss = loss / cfg.gradient_accumulation_steps
+        
+        loss.backward()
+        accum_loss += loss.item()
+
+        if (i + 1) % cfg.gradient_accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            opt.step(); sched.step(); opt.zero_grad(); ema.update(model)
+            optim_step += 1
+            pbar.update(1)
+            pbar.set_postfix(step=optim_step, loss=f"{accum_loss:.4f}")
+            accum_loss = 0
+            
+            if optim_step % cfg.save_interval == 0:
+                sd = os.path.join(cfg.output_dir, f"checkpoint-{optim_step}")
+                os.makedirs(sd, exist_ok=True)
+                torch.save({
+                    "step": optim_step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "scheduler_state_dict": sched.state_dict(),
+                    "ema_shadow": ema.shadow
+                }, os.path.join(sd, "trm_model.pt"))
+            if optim_step >= cfg.max_steps: break
+
+if __name__ == "__main__": main()
