@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-import os
-import math
-import random
-import torch
+import os, math, random, torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
@@ -12,7 +9,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import numpy as np
 
-# ── Helper: Find Latest Checkpoint ───────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────
 def get_latest_checkpoint(output_dir):
     if not os.path.exists(output_dir): return None, 0
     ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
@@ -40,7 +37,6 @@ class TRMConfig:
     ema_decay: float = 0.999
     tokenizer_name: str = "HuggingFaceTB/SmolLM-135M"
     dataset_subset: str = "sample-10BT"
-    # L40S Settings
     batch_size: int = 16 
     gradient_accumulation_steps: int = 4
     max_seq_length: int = 512
@@ -55,7 +51,7 @@ class TRMConfig:
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ── Components ──────────────────────────────────────────────────
+# ── Architecture Components ──────────────────────────────────────
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
@@ -92,9 +88,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, mask=None):
         B, L, D = x.shape
-        q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q, k, v = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2), \
+                  self.k_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2), \
+                  self.v_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q, k = apply_rope(q, self.rope_cos, self.rope_sin), apply_rope(k, self.rope_cos, self.rope_sin)
         if self.num_heads // self.num_kv_heads > 1:
             k, v = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1), v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
@@ -105,30 +101,14 @@ class CausalSelfAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.attn_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.attn = CausalSelfAttention(cfg)
+        self.attn_norm, self.attn = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps), CausalSelfAttention(cfg)
         self.mlp_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False),
-            nn.SiLU(),
-            nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
-        )
+        self.mlp = nn.Sequential(nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False), nn.SiLU(), nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False))
     def forward(self, x, mask=None):
         x = x + self.attn(self.attn_norm(x), mask)
         return x + self.mlp(self.mlp_norm(x))
 
-# ── Main Model (Structural Fix) ──────────────────────────────────
-class TinyRecursiveNet(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        # CRITICAL: This MUST be named 'blocks' to match your checkpoint
-        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
-        self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-
-    def forward(self, h, mask=None):
-        for block in self.blocks: h = block(h, mask)
-        return self.final_norm(h)
-
+# ── Main Model (Flattened for Checkpoint Compatibility) ──────────
 class TRMForCausalLM(nn.Module):
     def __init__(self, cfg, vocab_size):
         super().__init__()
@@ -136,8 +116,12 @@ class TRMForCausalLM(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, cfg.hidden_size)
         self.y_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
         self.z_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
-        # CRITICAL: This MUST be named 'net' to match your checkpoint
-        self.net = TinyRecursiveNet(cfg)
+        
+        # CRITICAL: Reverting 'net' to be the ModuleList of blocks directly.
+        # This matches keys like 'net.0.attn_norm.weight'
+        self.net = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
+        
+        self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.output_head = nn.Linear(cfg.hidden_size, vocab_size, bias=False)
         if cfg.tie_word_embeddings: self.output_head.weight = self.tok_emb.weight
         self.q_head = nn.Sequential(RMSNorm(cfg.hidden_size), nn.Linear(cfg.hidden_size, 1, bias=False))
@@ -150,8 +134,12 @@ class TRMForCausalLM(nn.Module):
         for _ in range(self.cfg.N_sup):
             for _ in range(self.cfg.T_recurse):
                 for _ in range(self.cfg.n_latent):
-                    z = self.net(x + y + z, mask)
-                y = self.net(y + z, mask)
+                    curr_z = x + y + z
+                    for b in self.net: curr_z = b(curr_z, mask)
+                    z = self.final_norm(curr_z)
+                curr_y = y + z
+                for b in self.net: curr_y = b(curr_y, mask)
+                y = self.final_norm(curr_y)
             logits = self.output_head(y)
             q = self.q_head(y).mean(dim=1).squeeze(-1)
             if labels is not None:
@@ -163,7 +151,7 @@ class TRMForCausalLM(nn.Module):
                 total_loss += lm_loss + 0.1 * F.binary_cross_entropy_with_logits(q, halt_target)
         return total_loss / self.cfg.N_sup, logits
 
-# ── Dataset & Training Loop ──────────────────────────────────────
+# ── Remaining Logic ──────────────────────────────────────────────
 class FinewebStream(IterableDataset):
     def __init__(self, tokenizer, cfg):
         self.tokenizer, self.cfg = tokenizer, cfg
@@ -186,8 +174,7 @@ class EMA:
 def main():
     cfg = TRMConfig()
     set_seed(cfg.seed)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name); tokenizer.pad_token = tokenizer.eos_token
     model = TRMForCausalLM(cfg, len(tokenizer)).to(cfg.device)
     ema = EMA(model, cfg.ema_decay)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
@@ -206,7 +193,6 @@ def main():
     pbar = tqdm(loader, total=cfg.max_steps, initial=start_step)
     optim_step, accum_loss = start_step, 0
     model.train()
-    
     for i, batch in enumerate(pbar):
         if i < start_step * cfg.gradient_accumulation_steps: continue
         input_ids, labels, mask = batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device), batch["attention_mask"].to(cfg.device)
@@ -219,7 +205,6 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
             opt.step(); sched.step(); opt.zero_grad(); ema.update(model)
             optim_step += 1
-            pbar.update(0) # Keep pbar synced
             pbar.set_postfix(step=optim_step, loss=f"{accum_loss:.4f}")
             accum_loss = 0
             if optim_step % cfg.save_interval == 0:
