@@ -2,28 +2,28 @@
 import os
 import math
 import random
-import re
-from dataclasses import dataclass
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
+from dataclasses import dataclass
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from datasets import load_dataset
 from tqdm import tqdm
+import numpy as np
 
+# ── Helpers ──────────────────────────────────────────────────────
+def get_latest_checkpoint(output_dir):
+    if not os.path.exists(output_dir): return None, 0
+    ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
+    if not ckpts: return None, 0
+    latest = sorted(ckpts, key=lambda x: int(x.split("-")[-1]))[-1]
+    return os.path.join(output_dir, latest), int(latest.split("-")[-1])
 
-# ── Reproducibility ──────────────────────────────────────────────
 def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-
-# ── Config ───────────────────────────────────────────────────────
 @dataclass
 class TRMConfig:
     hidden_size: int = 512
@@ -33,236 +33,195 @@ class TRMConfig:
     intermediate_size: int = 1376
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-5
-
+    tie_word_embeddings: bool = True
     n_latent: int = 6
     T_recurse: int = 3
-    N_sup: int = 16
-    inference_N_sup: int = 4
-
+    N_sup: int = 8
+    ema_decay: float = 0.999
     tokenizer_name: str = "HuggingFaceTB/SmolLM-135M"
-    dataset_name: str = "HuggingFaceFW/fineweb-edu"
     dataset_subset: str = "sample-10BT"
-
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 32
+    # L40S Optimized Batching
+    batch_size: int = 16 
+    gradient_accumulation_steps: int = 4
+    max_seq_length: int = 512
     learning_rate: float = 5e-4
     weight_decay: float = 0.1
     max_grad_norm: float = 1.0
     warmup_steps: int = 1000
-
     max_steps: int = 50000
     save_interval: int = 1000
-    max_seq_length: int = 256
-
-    use_gradient_checkpointing: bool = True
-    use_mixed_precision: bool = True
     output_dir: str = "./output_trm"
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-# ── RMSNorm ─────────────────────────────────────────────────────
+# ── Architecture ────────────────────────────────────────────────
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
-
     def forward(self, x):
-        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * rms * self.weight
+        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x.float() * rms).to(x.dtype) * self.weight
 
-
-# ── RoPE ────────────────────────────────────────────────────────
-def precompute_rope(dim, max_len, base=10000):
+def precompute_rope(dim, max_len, base=10000.0):
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
     t = torch.arange(max_len).float()
     freqs = torch.outer(t, freqs)
     return freqs.cos(), freqs.sin()
 
-
 def apply_rope(x, cos, sin):
-    B, H, L, D = x.shape
-    cos = cos[:L].view(1, 1, L, D // 2)
-    sin = sin[:L].view(1, 1, L, D // 2)
+    L = x.shape[2]
+    cos_s, sin_s = cos[:L, None, :], sin[:L, None, :]
+    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    return torch.cat([x1 * cos_s - x2 * sin_s, x2 * cos_s + x1 * sin_s], dim=-1)
 
-    x1, x2 = x[..., :D // 2], x[..., D // 2:]
-    return torch.cat([
-        x1 * cos - x2 * sin,
-        x2 * cos + x1 * sin
-    ], dim=-1)
-
-
-# ── Attention ───────────────────────────────────────────────────
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.num_heads = cfg.num_attention_heads
-        self.num_kv_heads = cfg.num_kv_heads
-        self.head_dim = cfg.hidden_size // cfg.num_attention_heads
-
+        self.num_heads, self.num_kv_heads = cfg.num_attention_heads, cfg.num_kv_heads
+        self.head_dim = cfg.hidden_size // self.num_heads
         self.q_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
         self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
-
         cos, sin = precompute_rope(self.head_dim, cfg.max_position_embeddings)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        self.register_buffer("rope_cos", cos); self.register_buffer("rope_sin", sin)
+        self.register_buffer("causal_mask", torch.triu(torch.full((cfg.max_position_embeddings, cfg.max_position_embeddings), float("-inf")), 1))
 
     def forward(self, x, mask=None):
         B, L, D = x.shape
+        q, k, v = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2), \
+                  self.k_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2), \
+                  self.v_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q, k = apply_rope(q, self.rope_cos, self.rope_sin), apply_rope(k, self.rope_cos, self.rope_sin)
+        if self.num_heads // self.num_kv_heads > 1:
+            k, v = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1), v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+        scores = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5) + self.causal_mask[:L, :L]
+        if mask is not None: scores += (1.0 - mask.unsqueeze(1).unsqueeze(2)) * -1e9
+        return self.o_proj((F.softmax(scores, dim=-1) @ v).transpose(1, 2).reshape(B, L, D))
 
-        q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        q = apply_rope(q, self.cos, self.sin)
-        k = apply_rope(k, self.cos, self.sin)
-
-        if self.num_heads != self.num_kv_heads:
-            k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-            v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        if mask is not None:
-            attn += (1 - mask[:, None, None, :]) * -1e9
-
-        attn = torch.softmax(attn, dim=-1)
-        out = attn @ v
-
-        return self.o_proj(out.transpose(1, 2).reshape(B, L, D))
-
-
-# ── Transformer Block ───────────────────────────────────────────
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.norm1 = RMSNorm(cfg.hidden_size)
-        self.attn = CausalSelfAttention(cfg)
-        self.norm2 = RMSNorm(cfg.hidden_size)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.hidden_size, cfg.intermediate_size),
-            nn.SiLU(),
-            nn.Linear(cfg.intermediate_size, cfg.hidden_size)
-        )
-
+        self.attn_norm, self.attn = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps), CausalSelfAttention(cfg)
+        self.mlp_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.mlp = nn.Sequential(nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False), nn.SiLU(), nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False))
     def forward(self, x, mask=None):
-        x = x + self.attn(self.norm1(x), mask)
-        x = x + self.mlp(self.norm2(x))
-        return x
+        x = x + self.attn(self.attn_norm(x), mask)
+        return x + self.mlp(self.mlp_norm(x))
 
-
-# ── Core Network ────────────────────────────────────────────────
-class TinyRecursiveNet(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
-        self.norm = RMSNorm(cfg.hidden_size)
-
-    def forward(self, x, mask=None):
-        for blk in self.blocks:
-            x = blk(x, mask)
-        return self.norm(x)
-
-
-# ── Model ───────────────────────────────────────────────────────
+# ── Main Model (Stable Recursive Forward) ────────────────────────
 class TRMForCausalLM(nn.Module):
     def __init__(self, cfg, vocab_size):
         super().__init__()
-        self.cfg = cfg
-        self.emb = nn.Embedding(vocab_size, cfg.hidden_size)
-        self.net = TinyRecursiveNet(cfg)
-        self.head = nn.Linear(cfg.hidden_size, vocab_size)
+        self.cfg, self.vocab_size = cfg, vocab_size
+        self.tok_emb = nn.Embedding(vocab_size, cfg.hidden_size)
+        self.y_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
+        self.z_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
+        self.net = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
+        self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.output_head = nn.Linear(cfg.hidden_size, vocab_size, bias=False)
+        if cfg.tie_word_embeddings: self.output_head.weight = self.tok_emb.weight
+        self.q_head = nn.Sequential(RMSNorm(cfg.hidden_size), nn.Linear(cfg.hidden_size, 1, bias=False))
 
-    def forward(self, input_ids, mask=None):
-        x = self.emb(input_ids)
-        x = self.net(x, mask)
-        logits = self.head(x)
-        return logits
+    def forward(self, ids, labels=None, mask=None):
+        B, L = ids.shape
+        x = self.tok_emb(ids)
+        y, z = self.y_init.expand(B, L, -1), self.z_init.expand(B, L, -1)
+        total_loss = 0
+        
+        # REMOVED: gradient_checkpointing - unrolling directly for stability
+        for _ in range(self.cfg.N_sup):
+            for _ in range(self.cfg.T_recurse):
+                for _ in range(self.cfg.n_latent):
+                    curr_z = x + y + z
+                    for b in self.net: curr_z = b(curr_z, mask)
+                    z = self.final_norm(curr_z)
+                curr_y = y + z
+                for b in self.net: curr_y = b(curr_y, mask)
+                y = self.final_norm(curr_y)
+            
+            logits = self.output_head(y)
+            q = self.q_head(y).mean(dim=1).squeeze(-1)
+            
+            if labels is not None:
+                shift_logits, shift_labels = logits[:, :-1, :].contiguous().view(-1, self.vocab_size), labels[:, 1:].contiguous().view(-1)
+                lm_loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+                with torch.no_grad():
+                    acc = (logits[:, :-1, :].argmax(-1) == labels[:, 1:]).float().mean()
+                    halt_target = (acc > 0.8).float().expand_as(q)
+                total_loss += lm_loss + 0.1 * F.binary_cross_entropy_with_logits(q, halt_target)
+        
+        return total_loss / self.cfg.N_sup, logits
 
-    def compute_loss(self, logits, labels):
-        return F.cross_entropy(
-            logits[:, :-1].reshape(-1, logits.size(-1)),
-            labels[:, 1:].reshape(-1),
-            ignore_index=-100
-        )
+# ── EMA & Data ───────────────────────────────────────────────────
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay, self.shadow = decay, {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
+    def update(self, model):
+        for n, p in model.named_parameters():
+            if n in self.shadow: self.shadow[n].copy_(self.decay * self.shadow[n] + (1 - self.decay) * p.data)
 
-
-# ── Dataset ─────────────────────────────────────────────────────
-class FinewebEduStreamingDataset(IterableDataset):
-    def __init__(self, tokenizer, max_len, subset):
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-
-        self.ds = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            name=subset,
-            split="train",
-            streaming=True
-        )
-
+class FinewebStream(IterableDataset):
+    def __init__(self, tokenizer, cfg):
+        self.tokenizer, self.cfg = tokenizer, cfg
     def __iter__(self):
-        for item in self.ds:
-            text = item["text"]
-            enc = self.tokenizer(
-                text,
-                max_length=self.max_len,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt"
-            )
-
-            out = {k: v.squeeze(0) for k, v in enc.items()}
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", name=self.cfg.dataset_subset, split="train", streaming=True)
+        for x in ds.shuffle(buffer_size=1000, seed=self.cfg.seed):
+            e = self.tokenizer(x["text"]+self.tokenizer.eos_token, max_length=self.cfg.max_seq_length, padding="max_length", truncation=True, return_tensors="pt")
+            out = {k: v.squeeze(0) for k, v in e.items()}
             out["labels"] = out["input_ids"].clone()
             out["labels"][out["attention_mask"] == 0] = -100
             yield out
 
-
-# ── Training ────────────────────────────────────────────────────
-def train():
+# ── Main ─────────────────────────────────────────────────────────
+def main():
     cfg = TRMConfig()
     set_seed(cfg.seed)
-
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
-    tokenizer.pad_token = tokenizer.eos_token
-
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name); tokenizer.pad_token = tokenizer.eos_token
     model = TRMForCausalLM(cfg, len(tokenizer)).to(cfg.device)
+    ema = EMA(model, cfg.ema_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    sched = get_cosine_schedule_with_warmup(opt, cfg.warmup_steps, cfg.max_steps)
 
-    dataset = FinewebEduStreamingDataset(tokenizer, cfg.max_seq_length, cfg.dataset_subset)
-    loader = DataLoader(dataset, batch_size=cfg.batch_size)
+    ckpt_path, start_step = get_latest_checkpoint(cfg.output_dir)
+    if ckpt_path:
+        print(f"Resuming from {ckpt_path}...")
+        ckpt = torch.load(os.path.join(ckpt_path, "trm_model.pt"), map_location=cfg.device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        opt.load_state_dict(ckpt["optimizer_state_dict"])
+        sched.load_state_dict(ckpt["scheduler_state_dict"])
+        if ckpt.get("ema_shadow"): ema.shadow = ckpt["ema_shadow"]
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, cfg.warmup_steps, cfg.max_steps)
-
-    step = 0
-    pbar = tqdm(loader)
-
-    for batch in pbar:
-        input_ids = batch["input_ids"].to(cfg.device)
-        labels = batch["labels"].to(cfg.device)
-        mask = batch["attention_mask"].to(cfg.device)
-
-        logits = model(input_ids, mask)
-        loss = model.compute_loss(logits, labels)
-
+    loader = DataLoader(FinewebStream(tokenizer, cfg), batch_size=cfg.batch_size)
+    pbar = tqdm(loader, total=cfg.max_steps, initial=start_step)
+    optim_step, accum_loss = start_step, 0
+    model.train()
+    
+    for i, batch in enumerate(pbar):
+        if i < start_step * cfg.gradient_accumulation_steps: continue
+        
+        input_ids, labels, mask = batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device), batch["attention_mask"].to(cfg.device)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss, _ = model(input_ids, labels, mask)
+            loss = loss / cfg.gradient_accumulation_steps
+        
         loss.backward()
+        accum_loss += loss.item()
 
-        if (step + 1) % cfg.gradient_accumulation_steps == 0:
+        if (i + 1) % cfg.gradient_accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+            opt.step(); sched.step(); opt.zero_grad(); ema.update(model)
+            optim_step += 1
+            pbar.set_postfix(step=optim_step, loss=f"{accum_loss:.4f}")
+            accum_loss = 0
+            if optim_step % cfg.save_interval == 0:
+                sd = os.path.join(cfg.output_dir, f"checkpoint-{optim_step}")
+                os.makedirs(sd, exist_ok=True)
+                torch.save({"step": optim_step, "model_state_dict": model.state_dict(), "optimizer_state_dict": opt.state_dict(), "scheduler_state_dict": sched.state_dict(), "ema_shadow": ema.shadow}, os.path.join(sd, "trm_model.pt"))
+            if optim_step >= cfg.max_steps: break
 
-        pbar.set_postfix(loss=loss.item())
-        step += 1
-
-        if step >= cfg.max_steps:
-            break
-
-
-# ── Entry ───────────────────────────────────────────────────────
 if __name__ == "__main__":
-    train()
+    torch.cuda.empty_cache() # Clear ghost tensors
+    main()
