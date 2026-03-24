@@ -37,7 +37,6 @@ class TRMConfig:
     ema_decay: float = 0.999
     tokenizer_name: str = "HuggingFaceTB/SmolLM-135M"
     dataset_subset: str = "sample-10BT"
-    # Hardware Optimized for your Node (16 CPU Cores / L40S)
     batch_size: int = 16 
     gradient_accumulation_steps: int = 4
     max_seq_length: int = 512
@@ -46,6 +45,7 @@ class TRMConfig:
     save_interval: int = 1000
     use_mixed_precision: bool = True
     output_dir: str = "./output_trm"
+    seed: int = 42 # FIXED: Added missing attribute
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ── Architecture Components ──────────────────────────────────────
@@ -65,7 +65,6 @@ def precompute_rope(dim, max_len, base=10000.0):
     return freqs.cos(), freqs.sin()
 
 def apply_rope(x, cos, sin):
-    # Fixed Shape Mismatch: (B, H, L, D) logic
     L = x.shape[2]
     cos_s = cos[:L, :].view(1, 1, L, -1)
     sin_s = sin[:L, :].view(1, 1, L, -1)
@@ -93,7 +92,6 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rope(q, self.rope_cos, self.rope_sin), apply_rope(k, self.rope_cos, self.rope_sin)
         if self.num_heads // self.num_kv_heads > 1:
             k, v = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1), v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-        # Optimized SDPA (Flash Attention)
         return self.o_proj(F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(B, L, D))
 
 class TransformerBlock(nn.Module):
@@ -113,7 +111,6 @@ class TRMForCausalLM(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, cfg.hidden_size)
         self.y_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
         self.z_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
-        # Flat structure to match your net.0, net.1 keys
         self.net = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
         self.final_norm = RMSNorm(cfg.hidden_size)
         self.output_head = nn.Linear(cfg.hidden_size, vocab_size, bias=False)
@@ -162,7 +159,6 @@ def main():
         sched.load_state_dict(ckpt["scheduler_state_dict"])
         if ckpt.get("ema_shadow"): ema.shadow = ckpt["ema_shadow"]
 
-    # Dataset Optimized for L40S and 16 CPU Cores
     ds = load_dataset("HuggingFaceFW/fineweb-edu", name=cfg.dataset_subset, split="train", streaming=True)
     def gen():
         for x in ds.shuffle(buffer_size=1000, seed=cfg.seed):
