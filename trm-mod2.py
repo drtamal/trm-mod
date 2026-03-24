@@ -2,6 +2,7 @@
 import os
 import math
 import random
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,18 +13,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import numpy as np
 
-# ── Helpers ──────────────────────────────────────────────────────
-def get_latest_checkpoint(output_dir):
-    if not os.path.exists(output_dir): return None, 0
-    ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
-    if not ckpts: return None, 0
-    latest = sorted(ckpts, key=lambda x: int(x.split("-")[-1]))[-1]
-    return os.path.join(output_dir, latest), int(latest.split("-")[-1])
-
-def set_seed(seed=42):
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-
+# ── Configuration ───────────────────────────────────────────────
 @dataclass
 class TRMConfig:
     hidden_size: int = 512
@@ -40,7 +30,7 @@ class TRMConfig:
     ema_decay: float = 0.999
     tokenizer_name: str = "HuggingFaceTB/SmolLM-135M"
     dataset_subset: str = "sample-10BT"
-    # L40S Optimized Batching
+    # L40S Optimized Settings (Disabled Checkpointing for Stability)
     batch_size: int = 16 
     gradient_accumulation_steps: int = 4
     max_seq_length: int = 512
@@ -54,7 +44,19 @@ class TRMConfig:
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ── Architecture ────────────────────────────────────────────────
+# ── Helper: Checkpoint Management ────────────────────────────────
+def get_latest_checkpoint(output_dir):
+    if not os.path.exists(output_dir): return None, 0
+    ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
+    if not ckpts: return None, 0
+    latest = sorted(ckpts, key=lambda x: int(x.split("-")[-1]))[-1]
+    return os.path.join(output_dir, latest), int(latest.split("-")[-1])
+
+def set_seed(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+# ── Architecture Components ──────────────────────────────────────
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
@@ -111,7 +113,7 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.attn_norm(x), mask)
         return x + self.mlp(self.mlp_norm(x))
 
-# ── Main Model (Stable Recursive Forward) ────────────────────────
+# ── Main Model ──────────────────────────────────────────────────
 class TRMForCausalLM(nn.Module):
     def __init__(self, cfg, vocab_size):
         super().__init__()
@@ -119,6 +121,7 @@ class TRMForCausalLM(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, cfg.hidden_size)
         self.y_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
         self.z_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
+        # FLATTENED ModuleList to match your checkpoint keys: net.0, net.1
         self.net = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
         self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.output_head = nn.Linear(cfg.hidden_size, vocab_size, bias=False)
@@ -130,8 +133,6 @@ class TRMForCausalLM(nn.Module):
         x = self.tok_emb(ids)
         y, z = self.y_init.expand(B, L, -1), self.z_init.expand(B, L, -1)
         total_loss = 0
-        
-        # REMOVED: gradient_checkpointing - unrolling directly for stability
         for _ in range(self.cfg.N_sup):
             for _ in range(self.cfg.T_recurse):
                 for _ in range(self.cfg.n_latent):
@@ -141,10 +142,8 @@ class TRMForCausalLM(nn.Module):
                 curr_y = y + z
                 for b in self.net: curr_y = b(curr_y, mask)
                 y = self.final_norm(curr_y)
-            
             logits = self.output_head(y)
             q = self.q_head(y).mean(dim=1).squeeze(-1)
-            
             if labels is not None:
                 shift_logits, shift_labels = logits[:, :-1, :].contiguous().view(-1, self.vocab_size), labels[:, 1:].contiguous().view(-1)
                 lm_loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
@@ -152,10 +151,28 @@ class TRMForCausalLM(nn.Module):
                     acc = (logits[:, :-1, :].argmax(-1) == labels[:, 1:]).float().mean()
                     halt_target = (acc > 0.8).float().expand_as(q)
                 total_loss += lm_loss + 0.1 * F.binary_cross_entropy_with_logits(q, halt_target)
-        
         return total_loss / self.cfg.N_sup, logits
 
-# ── EMA & Data ───────────────────────────────────────────────────
+# ── Resilient Data Streaming ────────────────────────────────────
+class FinewebStream(IterableDataset):
+    def __init__(self, tokenizer, cfg):
+        self.tokenizer, self.cfg = tokenizer, cfg
+
+    def __iter__(self):
+        while True:
+            try:
+                ds = load_dataset("HuggingFaceFW/fineweb-edu", name=self.cfg.dataset_subset, split="train", streaming=True)
+                for x in ds.shuffle(buffer_size=1000, seed=self.cfg.seed):
+                    e = self.tokenizer(x["text"]+self.tokenizer.eos_token, max_length=self.cfg.max_seq_length, padding="max_length", truncation=True, return_tensors="pt")
+                    out = {k: v.squeeze(0) for k, v in e.items()}
+                    out["labels"] = out["input_ids"].clone()
+                    out["labels"][out["attention_mask"] == 0] = -100
+                    yield out
+                break
+            except Exception as e:
+                print(f"Network error: {e}. Retrying in 5s...")
+                time.sleep(5)
+
 class EMA:
     def __init__(self, model, decay=0.999):
         self.decay, self.shadow = decay, {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
@@ -163,19 +180,7 @@ class EMA:
         for n, p in model.named_parameters():
             if n in self.shadow: self.shadow[n].copy_(self.decay * self.shadow[n] + (1 - self.decay) * p.data)
 
-class FinewebStream(IterableDataset):
-    def __init__(self, tokenizer, cfg):
-        self.tokenizer, self.cfg = tokenizer, cfg
-    def __iter__(self):
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", name=self.cfg.dataset_subset, split="train", streaming=True)
-        for x in ds.shuffle(buffer_size=1000, seed=self.cfg.seed):
-            e = self.tokenizer(x["text"]+self.tokenizer.eos_token, max_length=self.cfg.max_seq_length, padding="max_length", truncation=True, return_tensors="pt")
-            out = {k: v.squeeze(0) for k, v in e.items()}
-            out["labels"] = out["input_ids"].clone()
-            out["labels"][out["attention_mask"] == 0] = -100
-            yield out
-
-# ── Main ─────────────────────────────────────────────────────────
+# ── Training Loop ───────────────────────────────────────────────
 def main():
     cfg = TRMConfig()
     set_seed(cfg.seed)
@@ -187,22 +192,27 @@ def main():
 
     ckpt_path, start_step = get_latest_checkpoint(cfg.output_dir)
     if ckpt_path:
-        print(f"Resuming from {ckpt_path}...")
+        print(f"Loading checkpoint from {ckpt_path}...")
         ckpt = torch.load(os.path.join(ckpt_path, "trm_model.pt"), map_location=cfg.device)
         model.load_state_dict(ckpt["model_state_dict"])
         opt.load_state_dict(ckpt["optimizer_state_dict"])
         sched.load_state_dict(ckpt["scheduler_state_dict"])
         if ckpt.get("ema_shadow"): ema.shadow = ckpt["ema_shadow"]
 
-    loader = DataLoader(FinewebStream(tokenizer, cfg), batch_size=cfg.batch_size)
+    loader = DataLoader(FinewebStream(tokenizer, cfg), batch_size=cfg.batch_size, num_workers=0)
     pbar = tqdm(loader, total=cfg.max_steps, initial=start_step)
     optim_step, accum_loss = start_step, 0
     model.train()
     
+    # Skip already processed batches (Important for Iterable datasets)
+    skip_batches = start_step * cfg.gradient_accumulation_steps
+    
     for i, batch in enumerate(pbar):
-        if i < start_step * cfg.gradient_accumulation_steps: continue
+        if i < skip_batches: continue
         
         input_ids, labels, mask = batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device), batch["attention_mask"].to(cfg.device)
+        
+        # No Gradient Checkpointing = No Metadata Mismatch
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss, _ = model(input_ids, labels, mask)
             loss = loss / cfg.gradient_accumulation_steps
@@ -216,12 +226,11 @@ def main():
             optim_step += 1
             pbar.set_postfix(step=optim_step, loss=f"{accum_loss:.4f}")
             accum_loss = 0
+            
             if optim_step % cfg.save_interval == 0:
                 sd = os.path.join(cfg.output_dir, f"checkpoint-{optim_step}")
                 os.makedirs(sd, exist_ok=True)
                 torch.save({"step": optim_step, "model_state_dict": model.state_dict(), "optimizer_state_dict": opt.state_dict(), "scheduler_state_dict": sched.state_dict(), "ema_shadow": ema.shadow}, os.path.join(sd, "trm_model.pt"))
             if optim_step >= cfg.max_steps: break
 
-if __name__ == "__main__":
-    torch.cuda.empty_cache() # Clear ghost tensors
-    main()
+if __name__ == "__main__": main()
