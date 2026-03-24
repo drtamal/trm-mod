@@ -30,7 +30,6 @@ class TRMConfig:
     ema_decay: float = 0.999
     tokenizer_name: str = "HuggingFaceTB/SmolLM-135M"
     dataset_subset: str = "sample-10BT"
-    # L40S Optimized Settings (Disabled Checkpointing for Stability)
     batch_size: int = 16 
     gradient_accumulation_steps: int = 4
     max_seq_length: int = 512
@@ -44,7 +43,7 @@ class TRMConfig:
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ── Helper: Checkpoint Management ────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────
 def get_latest_checkpoint(output_dir):
     if not os.path.exists(output_dir): return None, 0
     ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
@@ -69,63 +68,96 @@ class RMSNorm(nn.Module):
 def precompute_rope(dim, max_len, base=10000.0):
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
     t = torch.arange(max_len).float()
-    freqs = torch.outer(t, freqs)
+    freqs = torch.outer(t, freqs) # [Max_Len, Dim//2]
     return freqs.cos(), freqs.sin()
 
 def apply_rope(x, cos, sin):
+    # x shape: [Batch, Heads, Seq_Len, Head_Dim]
+    # cos/sin shape: [Seq_Len, Head_Dim//2]
     L = x.shape[2]
-    cos_s, sin_s = cos[:L, None, :], sin[:L, None, :]
+    cos_s = cos[:L, None, :] # [Seq_Len, 1, Head_Dim//2] -> unsqueeze for heads
+    sin_s = sin[:L, None, :]
+    
+    # Reshape to match x: [1, 1, Seq_Len, Head_Dim//2]
+    cos_s = cos_s.transpose(0, 1).unsqueeze(0) 
+    sin_s = sin_s.transpose(0, 1).unsqueeze(0)
+    
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
     return torch.cat([x1 * cos_s - x2 * sin_s, x2 * cos_s + x1 * sin_s], dim=-1)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.num_heads, self.num_kv_heads = cfg.num_attention_heads, cfg.num_kv_heads
+        self.num_heads = cfg.num_attention_heads
+        self.num_kv_heads = cfg.num_kv_heads
         self.head_dim = cfg.hidden_size // self.num_heads
+        
         self.q_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
         self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
+        
         cos, sin = precompute_rope(self.head_dim, cfg.max_position_embeddings)
-        self.register_buffer("rope_cos", cos); self.register_buffer("rope_sin", sin)
+        self.register_buffer("rope_cos", cos)
+        self.register_buffer("rope_sin", sin)
         self.register_buffer("causal_mask", torch.triu(torch.full((cfg.max_position_embeddings, cfg.max_position_embeddings), float("-inf")), 1))
 
     def forward(self, x, mask=None):
         B, L, D = x.shape
-        q, k, v = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2), \
-                  self.k_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2), \
-                  self.v_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q, k = apply_rope(q, self.rope_cos, self.rope_sin), apply_rope(k, self.rope_cos, self.rope_sin)
+        q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        
+        q = apply_rope(q, self.rope_cos, self.rope_sin)
+        k = apply_rope(k, self.rope_cos, self.rope_sin)
+        
         if self.num_heads // self.num_kv_heads > 1:
-            k, v = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1), v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-        scores = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5) + self.causal_mask[:L, :L]
-        if mask is not None: scores += (1.0 - mask.unsqueeze(1).unsqueeze(2)) * -1e9
-        return self.o_proj((F.softmax(scores, dim=-1) @ v).transpose(1, 2).reshape(B, L, D))
+            k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            
+        scores = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        scores = scores + self.causal_mask[:L, :L]
+        
+        if mask is not None:
+            scores = scores + (1.0 - mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            
+        attn = F.softmax(scores, dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, L, D)
+        return self.o_proj(out)
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.attn_norm, self.attn = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps), CausalSelfAttention(cfg)
+        self.attn_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.attn = CausalSelfAttention(cfg)
         self.mlp_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.mlp = nn.Sequential(nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False), nn.SiLU(), nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False))
+        self.mlp = nn.Sequential(
+            nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False),
+            nn.SiLU(),
+            nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+        )
     def forward(self, x, mask=None):
         x = x + self.attn(self.attn_norm(x), mask)
-        return x + self.mlp(self.mlp_norm(x))
+        x = x + self.mlp(self.mlp_norm(x))
+        return x
 
 # ── Main Model ──────────────────────────────────────────────────
 class TRMForCausalLM(nn.Module):
     def __init__(self, cfg, vocab_size):
         super().__init__()
-        self.cfg, self.vocab_size = cfg, vocab_size
+        self.cfg = cfg
+        self.vocab_size = vocab_size
         self.tok_emb = nn.Embedding(vocab_size, cfg.hidden_size)
         self.y_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
         self.z_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
-        # FLATTENED ModuleList to match your checkpoint keys: net.0, net.1
+        
+        # Matches net.0, net.1 for your checkpoint
         self.net = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
+        
         self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.output_head = nn.Linear(cfg.hidden_size, vocab_size, bias=False)
-        if cfg.tie_word_embeddings: self.output_head.weight = self.tok_emb.weight
+        if cfg.tie_word_embeddings:
+            self.output_head.weight = self.tok_emb.weight
         self.q_head = nn.Sequential(RMSNorm(cfg.hidden_size), nn.Linear(cfg.hidden_size, 1, bias=False))
 
     def forward(self, ids, labels=None, mask=None):
@@ -133,27 +165,35 @@ class TRMForCausalLM(nn.Module):
         x = self.tok_emb(ids)
         y, z = self.y_init.expand(B, L, -1), self.z_init.expand(B, L, -1)
         total_loss = 0
+        
         for _ in range(self.cfg.N_sup):
             for _ in range(self.cfg.T_recurse):
                 for _ in range(self.cfg.n_latent):
                     curr_z = x + y + z
                     for b in self.net: curr_z = b(curr_z, mask)
                     z = self.final_norm(curr_z)
+                
                 curr_y = y + z
                 for b in self.net: curr_y = b(curr_y, mask)
                 y = self.final_norm(curr_y)
+                
             logits = self.output_head(y)
             q = self.q_head(y).mean(dim=1).squeeze(-1)
+            
             if labels is not None:
-                shift_logits, shift_labels = logits[:, :-1, :].contiguous().view(-1, self.vocab_size), labels[:, 1:].contiguous().view(-1)
+                shift_logits = logits[:, :-1, :].contiguous().view(-1, self.vocab_size)
+                shift_labels = labels[:, 1:].contiguous().view(-1)
                 lm_loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+                
                 with torch.no_grad():
                     acc = (logits[:, :-1, :].argmax(-1) == labels[:, 1:]).float().mean()
                     halt_target = (acc > 0.8).float().expand_as(q)
+                
                 total_loss += lm_loss + 0.1 * F.binary_cross_entropy_with_logits(q, halt_target)
+                
         return total_loss / self.cfg.N_sup, logits
 
-# ── Resilient Data Streaming ────────────────────────────────────
+# ── Data & Training ─────────────────────────────────────────────
 class FinewebStream(IterableDataset):
     def __init__(self, tokenizer, cfg):
         self.tokenizer, self.cfg = tokenizer, cfg
@@ -170,21 +210,24 @@ class FinewebStream(IterableDataset):
                     yield out
                 break
             except Exception as e:
-                print(f"Network error: {e}. Retrying in 5s...")
+                print(f"Stream error: {e}. Retrying...")
                 time.sleep(5)
 
 class EMA:
     def __init__(self, model, decay=0.999):
-        self.decay, self.shadow = decay, {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
+        self.decay = decay
+        self.shadow = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
     def update(self, model):
         for n, p in model.named_parameters():
-            if n in self.shadow: self.shadow[n].copy_(self.decay * self.shadow[n] + (1 - self.decay) * p.data)
+            if n in self.shadow:
+                self.shadow[n].copy_(self.decay * self.shadow[n] + (1 - self.decay) * p.data)
 
-# ── Training Loop ───────────────────────────────────────────────
 def main():
     cfg = TRMConfig()
     set_seed(cfg.seed)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name); tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    
     model = TRMForCausalLM(cfg, len(tokenizer)).to(cfg.device)
     ema = EMA(model, cfg.ema_decay)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
@@ -192,27 +235,26 @@ def main():
 
     ckpt_path, start_step = get_latest_checkpoint(cfg.output_dir)
     if ckpt_path:
-        print(f"Loading checkpoint from {ckpt_path}...")
+        print(f"Resuming from {ckpt_path}")
         ckpt = torch.load(os.path.join(ckpt_path, "trm_model.pt"), map_location=cfg.device)
         model.load_state_dict(ckpt["model_state_dict"])
         opt.load_state_dict(ckpt["optimizer_state_dict"])
         sched.load_state_dict(ckpt["scheduler_state_dict"])
-        if ckpt.get("ema_shadow"): ema.shadow = ckpt["ema_shadow"]
+        if "ema_shadow" in ckpt: ema.shadow = ckpt["ema_shadow"]
 
-    loader = DataLoader(FinewebStream(tokenizer, cfg), batch_size=cfg.batch_size, num_workers=0)
+    loader = DataLoader(FinewebStream(tokenizer, cfg), batch_size=cfg.batch_size)
     pbar = tqdm(loader, total=cfg.max_steps, initial=start_step)
     optim_step, accum_loss = start_step, 0
     model.train()
     
-    # Skip already processed batches (Important for Iterable datasets)
     skip_batches = start_step * cfg.gradient_accumulation_steps
-    
     for i, batch in enumerate(pbar):
         if i < skip_batches: continue
         
-        input_ids, labels, mask = batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device), batch["attention_mask"].to(cfg.device)
+        input_ids = batch["input_ids"].to(cfg.device)
+        labels = batch["labels"].to(cfg.device)
+        mask = batch["attention_mask"].to(cfg.device)
         
-        # No Gradient Checkpointing = No Metadata Mismatch
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss, _ = model(input_ids, labels, mask)
             loss = loss / cfg.gradient_accumulation_steps
@@ -222,7 +264,10 @@ def main():
 
         if (i + 1) % cfg.gradient_accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            opt.step(); sched.step(); opt.zero_grad(); ema.update(model)
+            opt.step()
+            sched.step()
+            opt.zero_grad()
+            ema.update(model)
             optim_step += 1
             pbar.set_postfix(step=optim_step, loss=f"{accum_loss:.4f}")
             accum_loss = 0
@@ -230,7 +275,14 @@ def main():
             if optim_step % cfg.save_interval == 0:
                 sd = os.path.join(cfg.output_dir, f"checkpoint-{optim_step}")
                 os.makedirs(sd, exist_ok=True)
-                torch.save({"step": optim_step, "model_state_dict": model.state_dict(), "optimizer_state_dict": opt.state_dict(), "scheduler_state_dict": sched.state_dict(), "ema_shadow": ema.shadow}, os.path.join(sd, "trm_model.pt"))
+                torch.save({
+                    "step": optim_step, 
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "scheduler_state_dict": sched.state_dict(),
+                    "ema_shadow": ema.shadow
+                }, os.path.join(sd, "trm_model.pt"))
             if optim_step >= cfg.max_steps: break
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
