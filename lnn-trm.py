@@ -26,8 +26,9 @@ class LNNConfig:
     dataset_subset: str = "sample-10BT"
     batch_size: int = 4
     gradient_accumulation_steps: int = 1
-    max_steps: int = 10000
-    save_interval: int = 1000
+    max_steps: int = 100000
+    save_interval: int = 10000
+    log_interval: int = 100
     output_dir: str = "./output_lnn"
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -86,7 +87,7 @@ class LiquidCell(nn.Module):
         attn = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(self.head_dim), dim=-1)
         attn_features = (attn @ v).reshape(B, L, -1)
         ode_features = x + attn_features
-        t = torch.linspace(0, 1, 2, device=x.device)
+        t = torch.linspace(0, 1, 8, device=x.device)
         x_out = odeint(lambda t, s: self.ode_step(t, s, ode_features), x, t, method="euler")[-1]
         return self.output_proj(self.norm(x_out))
 
@@ -126,7 +127,7 @@ class LNNForCausalLM(nn.Module):
                 for _ in range(self.cfg.n_latent):
                     curr_z = x + y + z
                     for layer in self.layers: curr_z = layer(curr_z)
-                    z = self.final_norm(curr_z)
+                    z = z + self.final_norm(curr_z)  # Residual update instead of overwrite
                 y = self.final_norm(sum(layer(y) for layer in self.layers))
             logits = self.output_head(y)
             q = self.q_head(y).mean(dim=1).squeeze(-1)
@@ -190,12 +191,39 @@ def main():
         else:
             loss, _ = model(input_ids, labels)
         loss.backward()
-        accum_loss += loss.item()
+        
+        # Check for NaN/Inf in loss and gradients
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"\n[Step {optim_step}] Loss is NaN/Inf - skipping")
+            opt.zero_grad()
+            continue
+        
+        has_nan_grad = any(torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None)
+        has_inf_grad = any(torch.isinf(p.grad).any() for p in model.parameters() if p.grad is not None)
+        if has_nan_grad or has_inf_grad:
+            print(f"\n[Step {optim_step}] NaN/Inf gradients detected - skipping")
+            opt.zero_grad()
+            continue
+        
+        # Log gradient stats periodically for debugging
+        if optim_step % cfg.log_interval == 0:
+            grad_norms = [p.grad.norm().item() for p in model.parameters() if p.grad is not None]
+            avg_grad = np.mean(grad_norms)
+            max_grad = np.max(grad_norms)
+            if optim_step % (cfg.log_interval * 10) == 0:
+                print(f"\n[Step {optim_step}] Grad stats - avg: {avg_grad:.4f}, max: {max_grad:.4f}, loss: {loss.item():.4f}")
+        
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        # Fixed accumulation - only reset after accumulation steps
+        accum_loss += loss.item()
+        
+        if (optim_step + 1) % cfg.gradient_accumulation_steps == 0:
+            pbar.set_postfix(step=optim_step + 1, loss=f"{accum_loss/cfg.gradient_accumulation_steps:.4f}")
+            accum_loss = 0
+        
         opt.step(); sched.step(); opt.zero_grad(); ema.update(model)
         optim_step += 1
-        pbar.set_postfix(step=optim_step, loss=f"{accum_loss:.4f}")
-        accum_loss = 0
         if optim_step % cfg.save_interval == 0:
             sd = os.path.join(cfg.output_dir, f"checkpoint-{optim_step}")
             os.makedirs(sd, exist_ok=True)
