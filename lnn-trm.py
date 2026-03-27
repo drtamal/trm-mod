@@ -26,12 +26,17 @@ class LNNConfig:
     dataset_subset: str = "sample-10BT"
     batch_size: int = 4
     gradient_accumulation_steps: int = 1
-    max_steps: int = 100000
+    num_epochs: int = 3
+    steps_per_epoch: int = 100000
     save_interval: int = 10000
     log_interval: int = 100
     output_dir: str = "./output_lnn"
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+@property
+def max_steps(self):
+    return self.num_epochs * self.steps_per_epoch
 
 def get_latest_checkpoint(output_dir):
     return None, 0
@@ -127,7 +132,7 @@ class LNNForCausalLM(nn.Module):
                 for _ in range(self.cfg.n_latent):
                     curr_z = x + y + z
                     for layer in self.layers: curr_z = layer(curr_z)
-                    z = z + self.final_norm(curr_z)  # Residual update instead of overwrite
+                    z = z + self.final_norm(curr_z)
                 y = self.final_norm(sum(layer(y) for layer in self.layers))
             logits = self.output_head(y)
             q = self.q_head(y).mean(dim=1).squeeze(-1)
@@ -140,6 +145,34 @@ class LNNForCausalLM(nn.Module):
                     halt_target = (acc > 0.8).float().expand_as(q)
                 total_loss += lm_loss + 0.1 * F.binary_cross_entropy_with_logits(q, halt_target)
         return total_loss / self.cfg.N_sup, logits
+    
+    @torch.no_grad()
+    def generate(self, input_ids, max_new_tokens=50, temperature=1.0, top_k=None):
+        self.eval()
+        input_ids = input_ids.to(self.cfg.device)
+        generated = input_ids.clone()
+        
+        for _ in range(max_new_tokens):
+            if generated.shape[1] >= self.cfg.max_seq_length:
+                break
+            
+            logits, _ = self(generated)
+            next_token_logits = logits[0, -1, :] / temperature
+            
+            if top_k is not None:
+                v, _ = torch.topk(next_token_logits, min(top_k, logits.shape[-1]))
+                next_token_logits[next_token_logits < v[-1]] = -float('inf')
+            
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            
+            if next_token.item() == self.tokenizer.eos_token_id:
+                break
+                
+            generated = torch.cat([generated, next_token.unsqueeze(0)], dim=1)
+        
+        self.train()
+        return generated
 
 class FinewebStream(IterableDataset):
     def __init__(self, tokenizer, cfg):
@@ -168,68 +201,120 @@ class EMA:
             if n in self.shadow:
                 self.shadow[n].copy_(self.decay * self.shadow[n] + (1 - self.decay) * p.data)
 
+TEST_PROMPTS = [
+    "Once upon a time in a distant galaxy",
+    "The quick brown fox jumps over",
+    "In the beginning God created",
+    "To be or not to be, that is",
+    "It was the best of times, it was",
+]
+
+def run_test_prompts(model, tokenizer, device):
+    print("\n" + "="*60)
+    print("TEST PROMPTS - Evaluating trained model")
+    print("="*60)
+    model.eval()
+    for prompt in TEST_PROMPTS:
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+        with torch.no_grad():
+            output_ids = model.generate(input_ids, max_new_tokens=50, temperature=0.8)
+        generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        print(f"\nPrompt: {prompt}")
+        print(f"Output: {generated_text}")
+    print("\n" + "="*60)
+    model.train()
+
 def main():
     cfg = LNNConfig()
     set_seed(cfg.seed)
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token
     model = LNNForCausalLM(cfg, len(tokenizer)).to(cfg.device)
+    model.tokenizer = tokenizer
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Total steps: {cfg.num_epochs * cfg.steps_per_epoch} ({cfg.num_epochs} epochs x {cfg.steps_per_epoch} steps)")
+    
     ema = EMA(model, cfg.ema_decay)
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
-    sched = get_cosine_schedule_with_warmup(opt, 100, cfg.max_steps)
+    
+    total_steps = cfg.num_epochs * cfg.steps_per_epoch
+    sched = get_cosine_schedule_with_warmup(opt, 100, total_steps)
+    
     loader = DataLoader(FinewebStream(tokenizer, cfg), batch_size=cfg.batch_size, num_workers=0)
-    pbar = tqdm(loader, total=cfg.max_steps)
-    optim_step, accum_loss = 0, 0
-    model.train()
-    for batch in pbar:
-        input_ids = batch["input_ids"].to(cfg.device)
-        labels = batch["labels"].to(cfg.device)
-        if cfg.device == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    
+    optim_step = 0
+    accum_loss = 0
+    
+    for epoch in range(1, cfg.num_epochs + 1):
+        print(f"\n{'='*60}")
+        print(f"EPOCH {epoch}/{cfg.num_epochs}")
+        print(f"{'='*60}")
+        
+        pbar = tqdm(loader, total=cfg.steps_per_epoch, desc=f"Epoch {epoch}")
+        model.train()
+        
+        for batch in pbar:
+            if optim_step >= cfg.steps_per_epoch * epoch:
+                break
+                
+            input_ids = batch["input_ids"].to(cfg.device)
+            labels = batch["labels"].to(cfg.device)
+            
+            if cfg.device == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss, _ = model(input_ids, labels)
+            else:
                 loss, _ = model(input_ids, labels)
-        else:
-            loss, _ = model(input_ids, labels)
-        loss.backward()
+            
+            loss.backward()
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n[Step {optim_step}] Loss is NaN/Inf - skipping")
+                opt.zero_grad()
+                continue
+            
+            has_nan_grad = any(torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None)
+            has_inf_grad = any(torch.isinf(p.grad).any() for p in model.parameters() if p.grad is not None)
+            if has_nan_grad or has_inf_grad:
+                print(f"\n[Step {optim_step}] NaN/Inf gradients detected - skipping")
+                opt.zero_grad()
+                continue
+            
+            if optim_step % cfg.log_interval == 0:
+                grad_norms = [p.grad.norm().item() for p in model.parameters() if p.grad is not None]
+                avg_grad = np.mean(grad_norms)
+                max_grad = np.max(grad_norms)
+                if optim_step % (cfg.log_interval * 10) == 0:
+                    print(f"\n[Step {optim_step}] Grad stats - avg: {avg_grad:.4f}, max: {max_grad:.4f}, loss: {loss.item():.4f}")
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            accum_loss += loss.item()
+            
+            if (optim_step + 1) % cfg.gradient_accumulation_steps == 0:
+                pbar.set_postfix(step=optim_step + 1, loss=f"{accum_loss/cfg.gradient_accumulation_steps:.4f}")
+                accum_loss = 0
+            
+            opt.step(); sched.step(); opt.zero_grad(); ema.update(model)
+            optim_step += 1
+            
+            if optim_step % cfg.save_interval == 0:
+                sd = os.path.join(cfg.output_dir, f"checkpoint-{optim_step}")
+                os.makedirs(sd, exist_ok=True)
+                torch.save({
+                    "step": optim_step,
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "scheduler_state_dict": sched.state_dict(),
+                    "ema_shadow": ema.shadow
+                }, os.path.join(sd, "lnn_model.pt"))
+                print(f"\nSaved checkpoint-{optim_step}")
         
-        # Check for NaN/Inf in loss and gradients
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"\n[Step {optim_step}] Loss is NaN/Inf - skipping")
-            opt.zero_grad()
-            continue
-        
-        has_nan_grad = any(torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None)
-        has_inf_grad = any(torch.isinf(p.grad).any() for p in model.parameters() if p.grad is not None)
-        if has_nan_grad or has_inf_grad:
-            print(f"\n[Step {optim_step}] NaN/Inf gradients detected - skipping")
-            opt.zero_grad()
-            continue
-        
-        # Log gradient stats periodically for debugging
-        if optim_step % cfg.log_interval == 0:
-            grad_norms = [p.grad.norm().item() for p in model.parameters() if p.grad is not None]
-            avg_grad = np.mean(grad_norms)
-            max_grad = np.max(grad_norms)
-            if optim_step % (cfg.log_interval * 10) == 0:
-                print(f"\n[Step {optim_step}] Grad stats - avg: {avg_grad:.4f}, max: {max_grad:.4f}, loss: {loss.item():.4f}")
-        
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
-        # Fixed accumulation - only reset after accumulation steps
-        accum_loss += loss.item()
-        
-        if (optim_step + 1) % cfg.gradient_accumulation_steps == 0:
-            pbar.set_postfix(step=optim_step + 1, loss=f"{accum_loss/cfg.gradient_accumulation_steps:.4f}")
-            accum_loss = 0
-        
-        opt.step(); sched.step(); opt.zero_grad(); ema.update(model)
-        optim_step += 1
-        if optim_step % cfg.save_interval == 0:
-            sd = os.path.join(cfg.output_dir, f"checkpoint-{optim_step}")
-            os.makedirs(sd, exist_ok=True)
-            torch.save({"step": optim_step, "model_state_dict": model.state_dict(), "optimizer_state_dict": opt.state_dict(), "scheduler_state_dict": sched.state_dict(), "ema_shadow": ema.shadow}, os.path.join(sd, "lnn_model.pt"))
-            print(f"\nSaved checkpoint-{optim_step}")
-        if optim_step >= cfg.max_steps: break
+        print(f"\n[Epoch {epoch} completed] Running test prompts...")
+        run_test_prompts(model, tokenizer, cfg.device)
+    
+    print(f"\nTraining complete! Total steps: {optim_step}")
 
 if __name__ == "__main__":
     main()
