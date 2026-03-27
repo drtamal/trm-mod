@@ -2,51 +2,48 @@
 import os, math, random, time, torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from dataclasses import dataclass
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
-from datasets import load_dataset
+from transformers import get_cosine_schedule_with_warmup
 from tqdm import tqdm
 import numpy as np
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except:
+    HAS_MATPLOTLIB = False
 from torchdiffeq import odeint
+
+OUTPUT_ROOT = "./output_lnn"
 
 @dataclass
 class LNNConfig:
-    hidden_size: int = 256
-    num_layers: int = 2
-    num_heads: int = 4
-    intermediate_size: int = 688
-    max_seq_length: int = 256
-    time_steps: int = 4
+    vocab_size: int = 128
+    hidden_size: int = 96
+    num_layers: int = 1
+    num_heads: int = 2
+    intermediate_size: int = 192
+    max_seq_length: int = 32
+    time_steps: int = 2
     rms_norm_eps: float = 1e-5
     tie_word_embeddings: bool = True
-    n_latent: int = 2
-    T_recurse: int = 2
-    N_sup: int = 2
-    ema_decay: float = 0.999
-    tokenizer_name: str = "HuggingFaceTB/SmolLM-135M"
-    dataset_subset: str = "sample-10BT"
-    batch_size: int = 4
+    n_latent: int = 1
+    T_recurse: int = 1
+    N_sup: int = 1
+    ema_decay: float = 0.99
+    batch_size: int = 8
     gradient_accumulation_steps: int = 1
-    num_epochs: int = 3
-    steps_per_epoch: int = 100000
-    save_interval: int = 10000
-    log_interval: int = 100
-    output_dir: str = "./output_lnn"
+    max_steps: int = 50000
+    learning_rate: float = 1e-3
+    save_interval: int = 1000
+    output_dir: str = OUTPUT_ROOT
     seed: int = 42
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-@property
-def max_steps(self):
-    return self.num_epochs * self.steps_per_epoch
-
-def get_latest_checkpoint(output_dir):
-    return None, 0
+    device: str = "cpu"
 
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
@@ -63,14 +60,12 @@ class LiquidGate(nn.Module):
         self.time_constant = nn.Parameter(torch.ones(1, 1, dim) * 0.5)
         self.gate = nn.Sequential(nn.Linear(dim, dim), nn.Sigmoid())
     def forward(self, x):
-        tc = torch.sigmoid(self.time_constant)
-        return tc * self.gate(x)
+        return torch.sigmoid(self.time_constant) * self.gate(x)
 
 class LiquidCell(nn.Module):
-    def __init__(self, dim, num_heads=4):
+    def __init__(self, dim, num_heads=2):
         super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
+        self.dim, self.num_heads = dim, num_heads
         self.head_dim = dim // num_heads
         self.W = nn.Parameter(torch.randn(dim, dim) * 0.02)
         self.U = nn.Parameter(torch.randn(dim, dim) * 0.02)
@@ -81,18 +76,19 @@ class LiquidCell(nn.Module):
         self.v_proj = nn.Linear(dim, dim)
         self.norm = RMSNorm(dim)
         self.output_proj = nn.Linear(dim, dim)
+
     def ode_step(self, t, x, input_features):
         dxdt = -F.relu(x @ self.W.T) + input_features @ self.U.T + self.b
         return self.liquid_gate(x) * dxdt
+
     def forward(self, x, input_features):
         B, L, D = x.shape
         q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim)
         k = self.k_proj(input_features).view(B, L, self.num_heads, self.head_dim)
         v = self.v_proj(input_features).view(B, L, self.num_heads, self.head_dim)
         attn = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(self.head_dim), dim=-1)
-        attn_features = (attn @ v).reshape(B, L, -1)
-        ode_features = x + attn_features
-        t = torch.linspace(0, 1, 8, device=x.device)
+        ode_features = x + (attn @ v).reshape(B, L, -1)
+        t = torch.linspace(0, 1, 2, device=x.device)
         x_out = odeint(lambda t, s: self.ode_step(t, s, ode_features), x, t, method="euler")[-1]
         return self.output_proj(self.norm(x_out))
 
@@ -106,215 +102,214 @@ class LiquidBlock(nn.Module):
         return x + self.mlp(self.mlp_norm(x + self.liquid_cell(x, x)))
 
 class LNNForCausalLM(nn.Module):
-    def __init__(self, cfg, vocab_size):
+    def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.vocab_size = vocab_size
-        self.tok_emb = nn.Embedding(vocab_size, cfg.hidden_size)
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.pos_emb = nn.Parameter(torch.randn(1, cfg.max_seq_length, cfg.hidden_size) * 0.02)
         self.y_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
         self.z_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.02)
         self.layers = nn.ModuleList([LiquidBlock(cfg) for _ in range(cfg.num_layers)])
         self.final_norm = RMSNorm(cfg.hidden_size)
-        self.output_head = nn.Linear(cfg.hidden_size, vocab_size, bias=False)
-        if cfg.tie_word_embeddings:
-            self.output_head.weight = self.tok_emb.weight
-        self.q_head = nn.Sequential(RMSNorm(cfg.hidden_size), nn.Linear(cfg.hidden_size, 1))
-    def forward(self, ids, labels=None, mask=None):
+        self.output_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        if cfg.tie_word_embeddings: self.output_head.weight = self.tok_emb.weight
+
+    def forward(self, ids, labels=None):
         B, L = ids.shape
         L = min(L, self.cfg.max_seq_length)
         x = self.tok_emb(ids[:, :L]) + self.pos_emb[:, :L, :]
-        y = self.y_init.expand(B, L, -1)
-        z = self.z_init.expand(B, L, -1)
-        total_loss = 0
-        for _ in range(self.cfg.N_sup):
-            for _ in range(self.cfg.T_recurse):
-                for _ in range(self.cfg.n_latent):
-                    curr_z = x + y + z
-                    for layer in self.layers: curr_z = layer(curr_z)
-                    z = z + self.final_norm(curr_z)
-                y = self.final_norm(sum(layer(y) for layer in self.layers))
-            logits = self.output_head(y)
-            q = self.q_head(y).mean(dim=1).squeeze(-1)
-            if labels is not None:
-                shift_logits = logits[:, :-1, :].contiguous().view(-1, self.vocab_size)
-                shift_labels = labels[:, 1:L].contiguous().view(-1)
-                lm_loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-                with torch.no_grad():
-                    acc = (logits[:, :-1, :].argmax(-1) == labels[:, 1:L]).float().mean()
-                    halt_target = (acc > 0.8).float().expand_as(q)
-                total_loss += lm_loss + 0.1 * F.binary_cross_entropy_with_logits(q, halt_target)
-        return total_loss / self.cfg.N_sup, logits
+        
+        for layer in self.layers:
+            x = layer(x)
+        
+        x = self.final_norm(x)
+        logits = self.output_head(x)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous().view(-1, self.cfg.vocab_size)
+            shift_labels = labels[:, 1:L].contiguous().view(-1)
+            shift_labels[shift_labels == 0] = -100
+            loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+        return loss, logits
+
+class CharDataset(IterableDataset):
+    def __init__(self, data, cfg):
+        self.cfg = cfg
+        self.vocab = sorted(set(ord(c) for c in data))
+        chars = [c for c in map(ord, data) if c in self.vocab]
+        print(f"Vocab size: {len(self.vocab)}, chars: {[chr(v) for v in self.vocab[:20]]}")
+        self.chunks = []
+        for i in range(0, len(chars) - cfg.max_seq_length, cfg.max_seq_length // 2):
+            self.chunks.append(chars[i:i+cfg.max_seq_length])
+        random.shuffle(self.chunks)
+        print(f"Total chunks: {len(self.chunks)}")
     
-    @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens=50, temperature=1.0, top_k=None):
-        self.eval()
-        input_ids = input_ids.to(self.cfg.device)
-        generated = input_ids.clone()
-        
-        for _ in range(max_new_tokens):
-            if generated.shape[1] >= self.cfg.max_seq_length:
-                break
-            
-            logits, _ = self(generated)
-            next_token_logits = logits[0, -1, :] / temperature
-            
-            if top_k is not None:
-                v, _ = torch.topk(next_token_logits, min(top_k, logits.shape[-1]))
-                next_token_logits[next_token_logits < v[-1]] = -float('inf')
-            
-            probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            
-            if next_token.item() == self.tokenizer.eos_token_id:
-                break
-                
-            generated = torch.cat([generated, next_token.unsqueeze(0)], dim=1)
-        
-        self.train()
-        return generated
-
-class FinewebStream(IterableDataset):
-    def __init__(self, tokenizer, cfg):
-        self.tokenizer, self.cfg = tokenizer, cfg
     def __iter__(self):
+        idx = 0
         while True:
-            try:
-                ds = load_dataset("HuggingFaceFW/fineweb-edu", name=self.cfg.dataset_subset, split="train", streaming=True)
-                for x in ds.shuffle(buffer_size=1000, seed=self.cfg.seed):
-                    e = self.tokenizer(x["text"]+self.tokenizer.eos_token, max_length=self.cfg.max_seq_length, padding="max_length", truncation=True, return_tensors="pt")
-                    out = {k: v.squeeze(0) for k, v in e.items()}
-                    out["labels"] = out["input_ids"].clone()
-                    out["labels"][out["attention_mask"] == 0] = -100
-                    yield out
-                break
-            except Exception as e:
-                print(f"Stream error: {e}. Retrying...")
-                time.sleep(5)
+            if idx >= len(self.chunks):
+                random.shuffle(self.chunks)
+                idx = 0
+            chunk = self.chunks[idx]
+            if len(chunk) < self.cfg.max_seq_length:
+                chunk = chunk + [0] * (self.cfg.max_seq_length - len(chunk))
+            yield {"input_ids": torch.tensor(chunk, dtype=torch.long), "labels": torch.tensor(chunk, dtype=torch.long)}
+            idx += 1
 
-class EMA:
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
-    def update(self, model):
-        for n, p in model.named_parameters():
-            if n in self.shadow:
-                self.shadow[n].copy_(self.decay * self.shadow[n] + (1 - self.decay) * p.data)
+def encode_text(text, cfg):
+    vocab = set(ord(c) for c in "".join(chr(i) for i in range(128)))
+    ids = [ord(c) if ord(c) in vocab else 0 for c in text]
+    return ids
 
-TEST_PROMPTS = [
-    "Once upon a time in a distant galaxy",
-    "The quick brown fox jumps over",
-    "In the beginning God created",
-    "To be or not to be, that is",
-    "It was the best of times, it was",
-]
+def decode_ids(ids, cfg):
+    return ''.join(chr(c) if c > 32 and c < 127 else '' for c in ids)
 
-def run_test_prompts(model, tokenizer, device):
-    print("\n" + "="*60)
-    print("TEST PROMPTS - Evaluating trained model")
-    print("="*60)
+def generate(model, cfg, prompt, max_new_tokens=50, temperature=0.8):
     model.eval()
-    for prompt in TEST_PROMPTS:
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    input_ids = encode_text(prompt, cfg)
+    while len(input_ids) < cfg.max_seq_length:
+        input_ids.append(0)
+    
+    generated = input_ids.copy()
+    for _ in range(max_new_tokens):
+        input_tensor = torch.tensor([generated[-cfg.max_seq_length:]], dtype=torch.long).to(cfg.device)
         with torch.no_grad():
-            output_ids = model.generate(input_ids, max_new_tokens=50, temperature=0.8)
-        generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        print(f"\nPrompt: {prompt}")
-        print(f"Output: {generated_text}")
-    print("\n" + "="*60)
-    model.train()
+            _, logits = model(input_tensor)
+        logits = logits[0, -1] / temperature
+        probs = torch.softmax(logits, dim=0)
+        probs[0] = 0
+        next_token = torch.multinomial(probs, 1).item()
+        generated.append(next_token)
+        if next_token == 0:
+            break
+    
+    result = decode_ids(generated[len(prompt):], cfg)
+    return result
+
+def evaluate_model(model, cfg):
+    test_prompts = [
+        "The quick brown",
+        "Hello world",
+        "Liquid neural",
+    ]
+    print("\n--- Evaluation ---")
+    model.eval()
+    for prompt in test_prompts:
+        input_ids = encode_text(prompt, cfg)
+        while len(input_ids) < cfg.max_seq_length:
+            input_ids.append(0)
+        input_tensor = torch.tensor([input_ids], dtype=torch.long).to(cfg.device)
+        with torch.no_grad():
+            _, logits = model(input_tensor)
+        probs = torch.softmax(logits[0, -1], dim=0)
+        probs[0] = 0
+        top_probs, top_indices = probs.topk(5)
+        print(f"Prompt: '{prompt}'")
+        print(f"Top tokens: {[(decode_ids([idx.item()], cfg), idx.item(), p.item()) for idx, p in zip(top_indices, top_probs)]}")
+        
+        generated = generate(model, cfg, prompt, max_new_tokens=30)
+        print(f"Generated: '{generated}'")
+        print()
 
 def main():
+    sample_text = (
+        "The quick brown fox jumps over the lazy dog. Hello world! Liquid neural networks are amazing. " * 1000 +
+        "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ " * 500 +
+        "0123456789 .!?," * 300 +
+        "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen " * 300 +
+        "apple banana cherry date grape lemon orange peach raspberry strawberry watermelon " * 300 +
+        "Monday Tuesday Wednesday Thursday Friday Saturday Sunday " * 300 +
+        "red blue green yellow orange purple pink black white brown gray cyan magenta " * 300 +
+        "cat dog bird fish horse rabbit turtle snake lizard frog mouse elephant lion tiger " * 300 +
+        "sun moon star planet galaxy universe asteroid comet meteor nebula blackhole " * 300 +
+        "water fire earth air lightning ice rock paper scissors " * 300
+    )
+    
+    actual_vocab = len(set(c for c in sample_text))
+    print(f"Auto-detected vocab size: {actual_vocab}")
+    
     cfg = LNNConfig()
+    cfg.vocab_size = 128
     set_seed(cfg.seed)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    model = LNNForCausalLM(cfg, len(tokenizer)).to(cfg.device)
-    model.tokenizer = tokenizer
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Total steps: {cfg.num_epochs * cfg.steps_per_epoch} ({cfg.num_epochs} epochs x {cfg.steps_per_epoch} steps)")
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    torch.set_num_threads(2)
+
+    model = LNNForCausalLM(cfg).to(cfg.device)
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {num_params:,}")
+
+    if num_params > 100000:
+        print(f"WARNING: Parameters exceed 100k limit!")
+
+    dataset = CharDataset(sample_text, cfg)
+    loader = DataLoader(dataset, batch_size=cfg.batch_size)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
+    sched = get_cosine_schedule_with_warmup(opt, 500, cfg.max_steps)
+
+    pbar = tqdm(loader, total=cfg.max_steps)
+    model.train()
     
-    ema = EMA(model, cfg.ema_decay)
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
-    
-    total_steps = cfg.num_epochs * cfg.steps_per_epoch
-    sched = get_cosine_schedule_with_warmup(opt, 100, total_steps)
-    
-    loader = DataLoader(FinewebStream(tokenizer, cfg), batch_size=cfg.batch_size, num_workers=0)
-    
-    optim_step = 0
-    accum_loss = 0
-    
-    for epoch in range(1, cfg.num_epochs + 1):
-        print(f"\n{'='*60}")
-        print(f"EPOCH {epoch}/{cfg.num_epochs}")
-        print(f"{'='*60}")
-        
-        pbar = tqdm(loader, total=cfg.steps_per_epoch, desc=f"Epoch {epoch}")
-        model.train()
-        
-        for batch in pbar:
-            if optim_step >= cfg.steps_per_epoch * epoch:
-                break
-                
-            input_ids = batch["input_ids"].to(cfg.device)
-            labels = batch["labels"].to(cfg.device)
-            
-            if cfg.device == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss, _ = model(input_ids, labels)
-            else:
-                loss, _ = model(input_ids, labels)
-            
-            loss.backward()
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\n[Step {optim_step}] Loss is NaN/Inf - skipping")
-                opt.zero_grad()
-                continue
-            
-            has_nan_grad = any(torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None)
-            has_inf_grad = any(torch.isinf(p.grad).any() for p in model.parameters() if p.grad is not None)
-            if has_nan_grad or has_inf_grad:
-                print(f"\n[Step {optim_step}] NaN/Inf gradients detected - skipping")
-                opt.zero_grad()
-                continue
-            
-            if optim_step % cfg.log_interval == 0:
-                grad_norms = [p.grad.norm().item() for p in model.parameters() if p.grad is not None]
-                avg_grad = np.mean(grad_norms)
-                max_grad = np.max(grad_norms)
-                if optim_step % (cfg.log_interval * 10) == 0:
-                    print(f"\n[Step {optim_step}] Grad stats - avg: {avg_grad:.4f}, max: {max_grad:.4f}, loss: {loss.item():.4f}")
-            
+    loss_history = []
+
+    for i, batch in enumerate(pbar):
+        input_ids = batch["input_ids"].to(cfg.device)
+        labels = batch["labels"].to(cfg.device)
+
+        loss, _ = model(input_ids, labels)
+        if loss is None:
+            continue
+        loss = loss / cfg.gradient_accumulation_steps
+        loss.backward()
+
+        if (i + 1) % cfg.gradient_accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
-            accum_loss += loss.item()
-            
-            if (optim_step + 1) % cfg.gradient_accumulation_steps == 0:
-                pbar.set_postfix(step=optim_step + 1, loss=f"{accum_loss/cfg.gradient_accumulation_steps:.4f}")
-                accum_loss = 0
-            
-            opt.step(); sched.step(); opt.zero_grad(); ema.update(model)
-            optim_step += 1
-            
-            if optim_step % cfg.save_interval == 0:
-                sd = os.path.join(cfg.output_dir, f"checkpoint-{optim_step}")
-                os.makedirs(sd, exist_ok=True)
-                torch.save({
-                    "step": optim_step,
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": opt.state_dict(),
-                    "scheduler_state_dict": sched.state_dict(),
-                    "ema_shadow": ema.shadow
-                }, os.path.join(sd, "lnn_model.pt"))
-                print(f"\nSaved checkpoint-{optim_step}")
+            opt.step()
+            sched.step()
+            opt.zero_grad()
+            loss_history.append(loss.item() * cfg.gradient_accumulation_steps)
+        pbar.set_postfix(loss=f"{loss.item() if loss else 0:.4f}")
+
+        step = i // cfg.gradient_accumulation_steps
+        if step > 0 and i % (cfg.save_interval * cfg.gradient_accumulation_steps) == 0:
+            path = os.path.join(cfg.output_dir, f"checkpoint-{step}.pt")
+            torch.save(model.state_dict(), path)
+
+        if step >= cfg.max_steps: break
+
+    if HAS_MATPLOTLIB and loss_history:
+        plt.figure(figsize=(10, 5))
+        plt.plot(loss_history)
+        plt.xlabel('Step')
+        plt.ylabel('Loss')
+        plt.title('Training Loss Curve')
+        plt.grid(True)
+        plt.savefig(os.path.join(cfg.output_dir, 'loss_curve.png'), dpi=150)
+        plt.close()
+        print(f"\nLoss curve saved to {cfg.output_dir}/loss_curve.png")
         
-        print(f"\n[Epoch {epoch} completed] Running test prompts...")
-        run_test_prompts(model, tokenizer, cfg.device)
-    
-    print(f"\nTraining complete! Total steps: {optim_step}")
+        if len(loss_history) > 100:
+            smoothed = np.convolve(loss_history, np.ones(100)/100, mode='valid')
+            plt.figure(figsize=(10, 5))
+            plt.plot(smoothed)
+            plt.xlabel('Step')
+            plt.ylabel('Loss')
+            plt.title('Training Loss Curve (Smoothed)')
+            plt.grid(True)
+            plt.savefig(os.path.join(cfg.output_dir, 'loss_curve_smoothed.png'), dpi=150)
+            plt.close()
+            print(f"Smoothed loss curve saved to {cfg.output_dir}/loss_curve_smoothed.png")
+
+    evaluate_model(model, cfg)
+
+    print("\n--- Interactive Mode ---")
+    while True:
+        prompt = input("\nEnter prompt (or 'quit'): ")
+        if prompt.lower() == 'quit':
+            break
+        generated = generate(model, cfg, prompt, max_new_tokens=50)
+        print(f"Generated: '{generated}'")
 
 if __name__ == "__main__":
     main()
