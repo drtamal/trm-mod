@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, math, random, torch, torch.nn as nn, torch.nn.functional as F
+import os, math, random, time, torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from dataclasses import dataclass
 from tqdm import tqdm
@@ -188,86 +188,25 @@ class TextStream(IterableDataset):
     def __init__(self, tokenizer, cfg):
         self.tokenizer = tokenizer
         self.cfg = cfg
-        self.corpus = [
-            "The quick brown fox jumps over the lazy dog.",
-            "A journey of a thousand miles begins with a single step.",
-            "To be or not to be that is the question.",
-            "All that glitters is not gold.",
-            "Actions speak louder than words.",
-            "Better late than never.",
-            "Birds of a feather flock together.",
-            "Curiosity killed the cat.",
-            "Every cloud has a silver lining.",
-            "Fortune favors the bold.",
-            "Knowledge is power.",
-            "Laughter is the best medicine.",
-            "Nothing ventured nothing gained.",
-            "Practice makes perfect.",
-            "Quality matters more than quantity.",
-            "Rome was not built in a day.",
-            "Slow and steady wins the race.",
-            "The early bird catches the worm.",
-            "Variety is the spice of life.",
-            "When in Rome do as the Romans do.",
-            "You cannot judge a book by its cover.",
-            "An apple a day keeps the doctor away.",
-            "Calm waters run deep.",
-            "Easy come easy go.",
-            "Time and tide wait for no one.",
-            "Where there is a will there is a way.",
-            "No pain no gain.",
-            "Think before you speak.",
-            "Read before you write.",
-            "Learn before you teach.",
-            "Pack light travel far.",
-            "Think clearly act boldly.",
-            "Write well read more.",
-            "Learn fast fail less.",
-            "Build strong test early.",
-            "Ship fast iterate slow.",
-            "The cat sat on the mat.",
-            "The dog ran in the park.",
-            "Birds fly in the sky.",
-            "Fish swim in the sea.",
-            "Stars shine at night.",
-            "The sun rises in the east.",
-            "Rain falls from clouds.",
-            "Snow covers the ground.",
-            "Winds blow through trees.",
-            "Rivers flow to the sea.",
-            "Mountains reach the sky.",
-            "Deserts are hot and dry.",
-            "Forests are green and dense.",
-            "Oceans are vast and deep.",
-            "Islands dot the Pacific.",
-            "Cities grow and change.",
-            "People work and play.",
-            "Children learn and grow.",
-            "Music fills the air.",
-            "Art expresses the soul.",
-            "Science探索s the unknown.",
-            "History repeats itself.",
-            "Math describes patterns.",
-            "Language connects minds.",
-            "Culture shapes society.",
-            "Technology changes fast.",
-            "Ideas power progress.",
-            "Dreams inspire action.",
-            "Hope lights the way.",
-            "Love conquers all.",
-        ]
+        self.dataset_name = "HuggingFaceFW/fineweb-edu"
+        self.dataset_subset = "sample-10BT"
     
     def __iter__(self):
-        rng = np.random.default_rng(self.cfg.seed)
         while True:
-            for _ in range(self.cfg.batch_size):
-                texts = rng.choice(self.corpus, size=3, replace=False)
-                text = " ".join(texts)
-                e = self.tokenizer(text, max_length=self.cfg.max_seq_length, padding=True, truncation=True)
-                out = {k: v.squeeze(0) for k, v in e.items()}
-                out["labels"] = out["input_ids"].clone()
-                out["labels"][out["input_ids"] == 0] = -100
-                yield out
+            try:
+                from datasets import load_dataset
+                ds = load_dataset(self.dataset_name, name=self.dataset_subset, split="train", streaming=True)
+                for x in ds.shuffle(buffer_size=10000, seed=self.cfg.seed):
+                    text = x["text"]
+                    e = self.tokenizer(text, max_length=self.cfg.max_seq_length, padding=True, truncation=True)
+                    out = {k: v.squeeze(0) for k, v in e.items()}
+                    out["labels"] = out["input_ids"].clone()
+                    out["labels"][out["input_ids"] == 0] = -100
+                    yield out
+            except Exception as e:
+                print(f"Dataset error: {e}. Retrying...")
+                import time
+                time.sleep(5)
 
 
 def count_parameters(model):
