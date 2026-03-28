@@ -15,8 +15,8 @@ class LNNConfig:
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size: int = 8
-    max_steps: int = 10000
-    save_interval: int = 5000
+    max_steps: int = 50000
+    save_interval: int = 25000
     log_interval: int = 100
     output_dir: str = "./output_lnn"
 
@@ -70,7 +70,7 @@ class RMSNorm(nn.Module):
 class LiquidGate(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.alpha = nn.Parameter(torch.tensor(0.1))
         self.gate = nn.Linear(dim, dim, bias=False)
     
     def forward(self, x):
@@ -83,13 +83,15 @@ class LiquidCell(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.liquid_gate = LiquidGate(dim)
-        self.W = nn.Linear(dim, dim, bias=False)
-        self.U = nn.Linear(dim, dim, bias=False)
+        self.W = nn.Linear(dim, dim, bias=True)
+        self.U = nn.Linear(dim, dim, bias=True)
+        nn.init.zeros_(self.W.weight)
+        nn.init.zeros_(self.U.weight)
     
     def forward(self, x, h):
         g = self.liquid_gate(x)
         dh = torch.tanh(self.W(x) + self.U(h))
-        return h + g * dh
+        return h + g * dh * 0.1
 
 
 class CausalAttention(nn.Module):
@@ -216,24 +218,51 @@ class TextStream(IterableDataset):
             "No pain no gain.",
             "Think before you speak.",
             "Read before you write.",
-            "Code before you test.",
             "Learn before you teach.",
-            "The quick red fox jumps over the lazy dog.",
             "Pack light travel far.",
             "Think clearly act boldly.",
             "Write well read more.",
-            "Code smart debug less.",
             "Learn fast fail less.",
             "Build strong test early.",
             "Ship fast iterate slow.",
+            "The cat sat on the mat.",
+            "The dog ran in the park.",
+            "Birds fly in the sky.",
+            "Fish swim in the sea.",
+            "Stars shine at night.",
+            "The sun rises in the east.",
+            "Rain falls from clouds.",
+            "Snow covers the ground.",
+            "Winds blow through trees.",
+            "Rivers flow to the sea.",
+            "Mountains reach the sky.",
+            "Deserts are hot and dry.",
+            "Forests are green and dense.",
+            "Oceans are vast and deep.",
+            "Islands dot the Pacific.",
+            "Cities grow and change.",
+            "People work and play.",
+            "Children learn and grow.",
+            "Music fills the air.",
+            "Art expresses the soul.",
+            "Science探索s the unknown.",
+            "History repeats itself.",
+            "Math describes patterns.",
+            "Language connects minds.",
+            "Culture shapes society.",
+            "Technology changes fast.",
+            "Ideas power progress.",
+            "Dreams inspire action.",
+            "Hope lights the way.",
+            "Love conquers all.",
         ]
     
     def __iter__(self):
         rng = np.random.default_rng(self.cfg.seed)
         while True:
             for _ in range(self.cfg.batch_size):
-                texts = rng.choice(self.corpus, size=2, replace=False)
-                text = texts[0] + " " + texts[1]
+                texts = rng.choice(self.corpus, size=3, replace=False)
+                text = " ".join(texts)
                 e = self.tokenizer(text, max_length=self.cfg.max_seq_length, padding=True, truncation=True)
                 out = {k: v.squeeze(0) for k, v in e.items()}
                 out["labels"] = out["input_ids"].clone()
