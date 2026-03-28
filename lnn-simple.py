@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, math, random, time, torch, torch.nn as nn, torch.nn.functional as F
+import os, math, random, torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from dataclasses import dataclass
 from tqdm import tqdm
@@ -9,41 +9,30 @@ import numpy as np
 @dataclass
 class LNNConfig:
     hidden_size: int = 64
-    num_layers: int = 2
-    intermediate_size: int = 128
+    num_layers: int = 4
     max_seq_length: int = 128
     vocab_size: int = 256
-    n_latent: int = 2
-    T_recurse: int = 1
-    tie_word_embeddings: bool = True
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size: int = 8
-    max_steps: int = 50000
-    save_interval: int = 10000
+    max_steps: int = 10000
+    save_interval: int = 5000
     log_interval: int = 100
     output_dir: str = "./output_lnn"
 
 
 class CharacterTokenizer:
     def __init__(self):
-        chars = list(" \nABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?-'\"()[]{}:;@#$%^&*+=<>|/\\~`")
-        self.stoi = {ch: i + 3 for i, ch in enumerate(chars)}
-        self.stoi['<pad>'] = 0
-        self.stoi['<bos>'] = 1
-        self.stoi['<eos>'] = 2
+        chars = " abcdefghijklmnopqrstuvwxyz.,!?-():;"
+        self.chars = chars
+        self.stoi = {ch: i + 1 for i, ch in enumerate(chars)}
         self.itos = {v: k for k, v in self.stoi.items()}
-        self.vocab_size = len(self.stoi)
+        self.vocab_size = len(self.stoi) + 1
         self.pad_token_id = 0
-        self.bos_token_id = 1
-        self.eos_token_id = 2
-        self.eos_token = '<eos>'
     
     def encode(self, text, max_length=128, padding=False, truncation=False):
-        ids = [self.bos_token_id]
-        for ch in text:
-            ids.append(self.stoi.get(ch, 2))
-        ids.append(self.eos_token_id)
+        ids = [self.stoi.get(ch, 0) for ch in text]
+        ids.append(0)
         if truncation and len(ids) > max_length:
             ids = ids[:max_length]
         if padding and len(ids) < max_length:
@@ -51,7 +40,7 @@ class CharacterTokenizer:
         return torch.tensor(ids, dtype=torch.long)
     
     def decode(self, ids):
-        return ''.join([self.itos.get(i, '<unk>') for i in ids if i not in [0, 1, 2]])
+        return ''.join([self.itos.get(i, '') for i in ids if i > 0])
     
     def __call__(self, text, max_length=128, padding=False, truncation=False, return_tensors=None):
         e = self.encode(text, max_length, padding, truncation)
@@ -69,76 +58,83 @@ def set_seed(seed=42):
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.g = nn.Parameter(torch.ones(dim))
         self.eps = eps
     
     def forward(self, x):
-        norm = torch.norm(x.float(), p=2, dim=-1, keepdim=True)
-        rms = norm / (x.shape[-1] ** 0.5 + self.eps)
-        return (x.float() / (rms + self.eps)).to(x.dtype) * self.weight
+        x = x.float()
+        norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (x * norm * self.g).to(x.dtype)
 
 
 class LiquidGate(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.time_alpha = nn.Parameter(torch.tensor(0.5))
-        self.gate_proj = nn.Linear(dim, dim)
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.gate = nn.Linear(dim, dim, bias=False)
     
     def forward(self, x):
-        alpha = torch.sigmoid(self.time_alpha)
-        gate = torch.sigmoid(self.gate_proj(x))
-        return alpha * gate
+        a = torch.sigmoid(self.alpha)
+        g = torch.sigmoid(self.gate(x))
+        return a * g
 
 
 class LiquidCell(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.dim = dim
-        self.W = nn.Parameter(torch.eye(dim) + torch.randn(dim, dim) * 0.01)
-        self.U = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.b = nn.Parameter(torch.zeros(dim))
         self.liquid_gate = LiquidGate(dim)
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        self.norm = RMSNorm(dim)
+        self.W = nn.Linear(dim, dim, bias=False)
+        self.U = nn.Linear(dim, dim, bias=False)
     
-    def forward(self, x, input_features):
+    def forward(self, x, h):
+        g = self.liquid_gate(x)
+        dh = torch.tanh(self.W(x) + self.U(h))
+        return h + g * dh
+
+
+class CausalAttention(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+    
+    def forward(self, x):
         B, L, D = x.shape
-        head_dim = max(1, D // 4)
+        q, k, v = self.qkv(x).split(D, dim=-1)
+        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         
-        q = self.q_proj(x)[:, :, :head_dim*4]
-        k = self.k_proj(input_features)[:, :, :head_dim*4]
-        v = self.v_proj(input_features)[:, :, :head_dim*4]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1)
+        attn = attn.masked_fill(mask, float('-inf'))
+        attn = F.softmax(attn, dim=-1)
         
-        q = q.view(B, L, 4, head_dim)
-        k = k.view(B, L, 4, head_dim)
-        v = v.view(B, L, 4, head_dim)
-        
-        scale = head_dim ** -0.5
-        attn = torch.softmax((q @ k.transpose(-2, -1)) * scale, dim=-1)
-        attn_out = (attn @ v).reshape(B, L, -1)
-        
-        dx = F.silu(x @ self.W.T) + attn_out + input_features @ self.U.T + self.b
-        return x + self.liquid_gate(x) * dx
+        return self.proj((attn @ v).transpose(1, 2).reshape(B, L, D))
 
 
 class LiquidBlock(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, dim, num_heads=4):
         super().__init__()
-        self.liquid_cell = LiquidCell(cfg.hidden_size)
+        self.attn = CausalAttention(dim, num_heads)
+        self.liquid = LiquidCell(dim)
         self.mlp = nn.Sequential(
-            nn.Linear(cfg.hidden_size, cfg.intermediate_size),
+            nn.Linear(dim, dim * 4),
             nn.GELU(),
-            nn.Linear(cfg.intermediate_size, cfg.hidden_size)
+            nn.Linear(dim * 4, dim)
         )
-        self.mlp_norm = RMSNorm(cfg.hidden_size)
-        self.cell_norm = RMSNorm(cfg.hidden_size)
+        self.ln1 = RMSNorm(dim)
+        self.ln2 = RMSNorm(dim)
+        self.ln3 = RMSNorm(dim)
     
-    def forward(self, x):
-        cell_out = self.cell_norm(x + self.liquid_cell(x, x))
-        return x + self.mlp(self.mlp_norm(cell_out))
+    def forward(self, x, h):
+        h = self.liquid(self.ln1(x), h)
+        x = x + self.attn(self.ln2(x))
+        x = x + self.mlp(self.ln3(h))
+        return x, h
 
 
 class LNNForCausalLM(nn.Module):
@@ -146,52 +142,39 @@ class LNNForCausalLM(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.pos_emb = nn.Parameter(torch.randn(1, cfg.max_seq_length, cfg.hidden_size) * 0.02)
-        self.y_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.01)
-        self.z_init = nn.Parameter(torch.randn(1, 1, cfg.hidden_size) * 0.01)
-        self.layers = nn.ModuleList([LiquidBlock(cfg) for _ in range(cfg.num_layers)])
-        self.final_norm = RMSNorm(cfg.hidden_size)
-        self.output_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.pos_emb = nn.Parameter(torch.zeros(1, cfg.max_seq_length, cfg.hidden_size))
+        self.blocks = nn.ModuleList([LiquidBlock(cfg.hidden_size, 4) for _ in range(cfg.num_layers)])
+        self.ln_f = RMSNorm(cfg.hidden_size)
+        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.tok_emb.weight
         
-        if cfg.tie_word_embeddings:
-            self.output_head.weight = self.tok_emb.weight
-        
-        self._init_weights()
+        self.apply(self._init)
     
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, std=0.02)
+    def _init(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
     
     def forward(self, ids, labels=None):
         B, L = ids.shape
         L = min(L, self.cfg.max_seq_length)
         
-        x = self.tok_emb(ids[:, :L]) + self.pos_emb[:, :L, :]
-        y = self.y_init.expand(B, L, -1)
-        z = self.z_init.expand(B, L, -1)
+        x = self.tok_emb(ids[:, :L])
+        x = x + self.pos_emb[:, :L, :]
         
-        for _ in range(self.cfg.T_recurse):
-            for _ in range(self.cfg.n_latent):
-                curr_z = x + y + z
-                for layer in self.layers:
-                    curr_z = layer(curr_z)
-                z = z + self.final_norm(curr_z)
-            
-            for layer in self.layers:
-                y = layer(y)
-            y = self.final_norm(y)
+        h = x
+        for block in self.blocks:
+            x, h = block(x, h)
         
-        logits = self.output_head(y)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
         
-        total_loss = 0
+        total_loss = torch.tensor(0.0, device=x.device)
         if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_logits = shift_logits.view(-1, self.cfg.vocab_size)
+            shift_logits = logits[:, :-1, :].contiguous().view(-1, self.cfg.vocab_size)
             shift_labels = labels[:, 1:L].contiguous().view(-1)
             loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
             total_loss = loss
@@ -204,62 +187,53 @@ class TextStream(IterableDataset):
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.corpus = [
-            "The quick brown fox jumps over the lazy dog. ",
-            "A journey of a thousand miles begins with a single step. ",
-            "To be or not to be that is the question. ",
-            "All that glitters is not gold. ",
-            "Actions speak louder than words. ",
-            "Better late than never. ",
-            "Birds of a feather flock together. ",
-            "Curiosity killed the cat but satisfaction brought it back. ",
-            "Don t count your chickens before they hatch. ",
-            "Every cloud has a silver lining. ",
-            "Fortune favors the bold. ",
-            "Knowledge is power. ",
-            "Laughter is the best medicine. ",
-            "Make virtue of necessity. ",
-            "Nothing ventured nothing gained. ",
-            "Opportunity knocks but once. ",
-            "Practice makes perfect. ",
-            "Quality matters more than quantity. ",
-            "Rome was not built in a day. ",
-            "Slow and steady wins the race. ",
-            "The early bird catches the worm. ",
-            "Understanding is the key to success. ",
-            "Variety is the spice of life. ",
-            "When in Rome do as the Romans do. ",
-            "You cannot judge a book by its cover. ",
-            "An apple a day keeps the doctor away. ",
-            "Biting the bullet and moving forward. ",
-            "Calm waters run deep. ",
-            "Dawn waits for no one. ",
-            "Easy come easy go. ",
+            "The quick brown fox jumps over the lazy dog.",
+            "A journey of a thousand miles begins with a single step.",
+            "To be or not to be that is the question.",
+            "All that glitters is not gold.",
+            "Actions speak louder than words.",
+            "Better late than never.",
+            "Birds of a feather flock together.",
+            "Curiosity killed the cat.",
+            "Every cloud has a silver lining.",
+            "Fortune favors the bold.",
+            "Knowledge is power.",
+            "Laughter is the best medicine.",
+            "Nothing ventured nothing gained.",
+            "Practice makes perfect.",
+            "Quality matters more than quantity.",
+            "Rome was not built in a day.",
+            "Slow and steady wins the race.",
+            "The early bird catches the worm.",
+            "Variety is the spice of life.",
+            "When in Rome do as the Romans do.",
+            "You cannot judge a book by its cover.",
+            "An apple a day keeps the doctor away.",
+            "Calm waters run deep.",
+            "Easy come easy go.",
+            "Time and tide wait for no one.",
+            "Where there is a will there is a way.",
+            "No pain no gain.",
+            "Think before you speak.",
+            "Read before you write.",
+            "Code before you test.",
+            "Learn before you teach.",
+            "The quick red fox jumps over the lazy dog.",
+            "Pack light travel far.",
+            "Think clearly act boldly.",
+            "Write well read more.",
+            "Code smart debug less.",
+            "Learn fast fail less.",
+            "Build strong test early.",
+            "Ship fast iterate slow.",
         ]
-        self.base_text = "The Liquid Neural Network processes sequential data through continuous transformations. "
-        "Each unit maintains an internal state that evolves over time. "
-        "The network learns to gate information flow adaptively. "
-        "Gradient descent optimizes the model parameters. "
-        "Attention mechanisms help focus on relevant features. "
-        "Recurrent connections enable memory of past inputs. "
-        "The model architecture balances expressiveness and efficiency. "
-        "Training involves minimizing prediction errors across sequences. "
-        "Token embeddings capture semantic relationships between symbols. "
-        "Position encodings provide order information to the model. "
-        "Normalization stabilizes training dynamics. "
-        "Skip connections facilitate gradient flow through deep networks. "
-        "Nonlinearities enable modeling of complex patterns. "
-        "The loss function measures the difference between predictions and targets. "
-        "Backpropagation computes gradients efficiently through the computational graph. "
     
     def __iter__(self):
         rng = np.random.default_rng(self.cfg.seed)
         while True:
-            texts = []
             for _ in range(self.cfg.batch_size):
-                text = self.base_text + rng.choice(self.corpus) * 3
-                texts.append(text)
-            
-            for text in texts:
+                texts = rng.choice(self.corpus, size=2, replace=False)
+                text = texts[0] + " " + texts[1]
                 e = self.tokenizer(text, max_length=self.cfg.max_seq_length, padding=True, truncation=True)
                 out = {k: v.squeeze(0) for k, v in e.items()}
                 out["labels"] = out["input_ids"].clone()
@@ -287,6 +261,7 @@ def train():
         print(f"Model size OK ({num_params} <= 100000)")
     
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=3e-4, total_steps=cfg.max_steps + 1, pct_start=0.1)
     
     loader = DataLoader(TextStream(tokenizer, cfg), batch_size=cfg.batch_size, num_workers=0)
     pbar = tqdm(loader, total=cfg.max_steps)
@@ -309,22 +284,17 @@ def train():
             continue
         
         loss.backward()
-        
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
         opt.step()
+        sched.step()
         
         if step % cfg.log_interval == 0:
-            pbar.set_postfix(loss=f"{loss.item():.4f}", grad=f"{grad_norm.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{sched.get_last_lr()[0]:.6f}")
         
         if step % cfg.save_interval == 0 and step > 0:
             sd = os.path.join(cfg.output_dir, f"checkpoint-{step}")
             os.makedirs(sd, exist_ok=True)
-            torch.save({
-                "step": step,
-                "model_state_dict": model.state_dict(),
-                "config": cfg,
-            }, os.path.join(sd, "lnn_model.pt"))
+            torch.save({"step": step, "model_state_dict": model.state_dict(), "config": cfg}, os.path.join(sd, "lnn_model.pt"))
             print(f"\nSaved checkpoint-{step}")
         
         if step >= cfg.max_steps:
@@ -338,18 +308,14 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=0.8, top_k
     device = next(model.parameters()).device
     
     input_ids = tokenizer(prompt, max_length=model.cfg.max_seq_length, truncation=True)["input_ids"].to(device)
-    
-    if input_ids.shape[-1] >= model.cfg.max_seq_length:
-        input_ids = input_ids[:, -model.cfg.max_seq_length+1:]
-    
-    generated = input_ids
+    prompt_len = input_ids.shape[-1]
     
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            if generated.shape[-1] >= model.cfg.max_seq_length:
+            if input_ids.shape[-1] >= model.cfg.max_seq_length:
                 break
             
-            logits, _ = model(generated)
+            _, logits = model(input_ids)
             next_token_logits = logits[:, -1, :] / temperature
             
             if top_k > 0:
@@ -359,12 +325,15 @@ def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=0.8, top_k
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             
-            generated = torch.cat([generated, next_token], dim=-1)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
             
-            if next_token.item() == tokenizer.eos_token_id:
+            if next_token.item() == 0:
                 break
     
-    return tokenizer.decode(generated[0].tolist())
+    full_text = tokenizer.decode(input_ids[0].tolist())
+    if len(full_text) > prompt_len:
+        return full_text[prompt_len:]
+    return full_text
 
 
 if __name__ == "__main__":
