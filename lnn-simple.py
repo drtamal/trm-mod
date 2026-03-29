@@ -1,322 +1,231 @@
 #!/usr/bin/env python3
-import os, math, random, time, torch, torch.nn as nn, torch.nn.functional as F
+import os, math, random, torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from dataclasses import dataclass
 from tqdm import tqdm
 import numpy as np
 
-
+# ================= CONFIG =================
 @dataclass
 class LNNConfig:
-    hidden_size: int = 64
-    num_layers: int = 4
-    max_seq_length: int = 128
-    vocab_size: int = 256
+    hidden_size: int = 384
+    num_layers: int = 8
+    num_heads: int = 8
+    max_seq_length: int = 512
+    vocab_size: int = 0
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size: int = 8
-    max_steps: int = 50000
-    save_interval: int = 25000
-    log_interval: int = 100
+    batch_size: int = 8        # 8 * 4 = 32 Effective Batch Size
+    grad_accum: int = 4
+    max_steps: int = 10000
+    save_interval: int = 2000
+    log_interval: int = 1
+    eval_interval: int = 2000
     output_dir: str = "./output_lnn"
+    label_smoothing: float = 0.05
+    warmup_steps: int = 500
+    max_lr: float = 3e-4
+    min_lr: float = 3e-5
+    weight_decay: float = 0.1
 
-
+# ================= TOKENIZER =================
 class CharacterTokenizer:
     def __init__(self):
-        chars = " abcdefghijklmnopqrstuvwxyz.,!?-():;"
-        self.chars = chars
+        chars = " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~\n\t"
         self.stoi = {ch: i + 1 for i, ch in enumerate(chars)}
         self.itos = {v: k for k, v in self.stoi.items()}
-        self.vocab_size = len(self.stoi) + 1
         self.pad_token_id = 0
-    
-    def encode(self, text, max_length=128, padding=False, truncation=False):
-        ids = [self.stoi.get(ch, 0) for ch in text]
-        ids.append(0)
-        if truncation and len(ids) > max_length:
-            ids = ids[:max_length]
-        if padding and len(ids) < max_length:
-            ids.extend([self.pad_token_id] * (max_length - len(ids)))
-        return torch.tensor(ids, dtype=torch.long)
-    
+        self.vocab_size = len(self.stoi) + 1
+        self.unique_count = len(self.stoi)
+
+    def encode(self, text):
+        return [self.stoi.get(ch, 0) for ch in text]
+
     def decode(self, ids):
         return ''.join([self.itos.get(i, '') for i in ids if i > 0])
-    
-    def __call__(self, text, max_length=128, padding=False, truncation=False, return_tensors=None):
-        e = self.encode(text, max_length, padding, truncation)
-        return {"input_ids": e.unsqueeze(0)}
 
-
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
+# ================= CORE COMPONENTS =================
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
-        super().__init__()
-        self.g = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-    
-    def forward(self, x):
-        x = x.float()
-        norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x * norm * self.g).to(x.dtype)
-
-
-class LiquidGate(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(0.1))
-        self.gate = nn.Linear(dim, dim, bias=False)
-    
-    def forward(self, x):
-        a = torch.sigmoid(self.alpha)
-        g = torch.sigmoid(self.gate(x))
-        return a * g
+        self.g = nn.Parameter(torch.ones(dim))
 
+    def forward(self, x):
+        norm = x.pow(2).mean(-1, keepdim=True).add(1e-5).rsqrt()
+        return x * norm * self.g
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=1024):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+        t = torch.arange(max_seq_len)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer('cos', emb.cos()[None, None, :, :])
+        self.register_buffer('sin', emb.sin()[None, None, :, :])
+
+    def forward(self, L):
+        return self.cos[:, :, :L, :], self.sin[:, :, :L, :]
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+class CausalAttention(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+        self.rope = RotaryEmbedding(self.head_dim)
+
+    def forward(self, x):
+        B, L, D = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(B, L, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, L, self.heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rope(L)
+        q = (q * cos) + (rotate_half(q) * sin)
+        k = (k * cos) + (rotate_half(k) * sin)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        mask = torch.triu(torch.ones(L, L, device=x.device), 1).bool()
+        attn = attn.masked_fill(mask, float('-inf'))
+        attn = F.softmax(attn, dim=-1)
+        return self.proj((attn @ v).transpose(1, 2).reshape(B, L, D))
 
 class LiquidCell(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.liquid_gate = LiquidGate(dim)
-        self.W = nn.Linear(dim, dim, bias=True)
-        self.U = nn.Linear(dim, dim, bias=True)
-        nn.init.zeros_(self.W.weight)
-        nn.init.zeros_(self.U.weight)
-    
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.W = nn.Linear(dim, dim)
+        self.U = nn.Linear(dim, dim)
+
     def forward(self, x, h):
-        g = self.liquid_gate(x)
+        g = torch.sigmoid(self.alpha)
         dh = torch.tanh(self.W(x) + self.U(h))
         return h + g * dh * 0.1
 
-
-class CausalAttention(nn.Module):
-    def __init__(self, dim, num_heads=4):
+class Block(nn.Module):
+    def __init__(self, dim, heads):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.proj = nn.Linear(dim, dim)
-    
-    def forward(self, x):
-        B, L, D = x.shape
-        q, k, v = self.qkv(x).split(D, dim=-1)
-        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1)
-        attn = attn.masked_fill(mask, float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-        
-        return self.proj((attn @ v).transpose(1, 2).reshape(B, L, D))
-
-
-class LiquidBlock(nn.Module):
-    def __init__(self, dim, num_heads=4):
-        super().__init__()
-        self.attn = CausalAttention(dim, num_heads)
+        self.attn = CausalAttention(dim, heads)
         self.liquid = LiquidCell(dim)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim)
+            nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim)
         )
-        self.ln1 = RMSNorm(dim)
-        self.ln2 = RMSNorm(dim)
-        self.ln3 = RMSNorm(dim)
-    
+        self.ln1, self.ln2, self.ln3 = RMSNorm(dim), RMSNorm(dim), RMSNorm(dim)
+
     def forward(self, x, h):
         h = self.liquid(self.ln1(x), h)
         x = x + self.attn(self.ln2(x))
         x = x + self.mlp(self.ln3(h))
         return x, h
 
-
-class LNNForCausalLM(nn.Module):
+class LNN(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.pos_emb = nn.Parameter(torch.zeros(1, cfg.max_seq_length, cfg.hidden_size))
-        self.blocks = nn.ModuleList([LiquidBlock(cfg.hidden_size, 4) for _ in range(cfg.num_layers)])
-        self.ln_f = RMSNorm(cfg.hidden_size)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        self.lm_head.weight = self.tok_emb.weight
-        
-        self.apply(self._init)
-    
-    def _init(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Embedding):
-            nn.init.normal_(m.weight, std=0.02)
-    
+        self.emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.blocks = nn.ModuleList([Block(cfg.hidden_size, cfg.num_heads) for _ in range(cfg.num_layers)])
+        self.ln = RMSNorm(cfg.hidden_size)
+        self.head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.head.weight = self.emb.weight
+
     def forward(self, ids, labels=None):
-        B, L = ids.shape
-        L = min(L, self.cfg.max_seq_length)
-        
-        x = self.tok_emb(ids[:, :L])
-        x = x + self.pos_emb[:, :L, :]
-        
+        x = self.emb(ids)
         h = x
-        for block in self.blocks:
-            x, h = block(x, h)
+        for b in self.blocks: x, h = b(x, h)
+        logits = self.head(self.ln(x))
         
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-        
-        total_loss = torch.tensor(0.0, device=x.device)
+        loss = None
         if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous().view(-1, self.cfg.vocab_size)
-            shift_labels = labels[:, 1:L].contiguous().view(-1)
-            loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-            total_loss = loss
-        
-        return total_loss, logits
+            loss = F.cross_entropy(logits[:, :-1].reshape(-1, self.cfg.vocab_size), 
+                                   labels[:, 1:].reshape(-1), ignore_index=-100)
+        return loss, logits
 
-
-class TextStream(IterableDataset):
+# ================= DATA PACKING =================
+class PackingDataset(IterableDataset):
     def __init__(self, tokenizer, cfg):
         self.tokenizer = tokenizer
         self.cfg = cfg
-        self.dataset_name = "HuggingFaceFW/fineweb-edu"
-        self.dataset_subset = "sample-10BT"
-    
+        from datasets import load_dataset
+        self.ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+
     def __iter__(self):
-        while True:
-            try:
-                from datasets import load_dataset
-                ds = load_dataset(self.dataset_name, name=self.dataset_subset, split="train", streaming=True)
-                for x in ds.shuffle(buffer_size=10000, seed=self.cfg.seed):
-                    text = x["text"]
-                    e = self.tokenizer(text, max_length=self.cfg.max_seq_length, padding=True, truncation=True)
-                    out = {k: v.squeeze(0) for k, v in e.items()}
-                    out["labels"] = out["input_ids"].clone()
-                    out["labels"][out["input_ids"] == 0] = -100
-                    yield out
-            except Exception as e:
-                print(f"Dataset error: {e}. Retrying...")
-                import time
-                time.sleep(5)
+        buffer = []
+        for example in self.ds:
+            buffer.extend(self.tokenizer.encode(example["text"]))
+            buffer.append(self.tokenizer.pad_token_id)
+            while len(buffer) >= self.cfg.max_seq_length:
+                chunk = buffer[:self.cfg.max_seq_length]
+                buffer = buffer[self.cfg.max_seq_length:]
+                yield {"input_ids": torch.tensor(chunk), "labels": torch.tensor(chunk)}
 
+# ================= UTILS =================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def get_lr(cfg, step):
+    if step < cfg.warmup_steps:
+        return cfg.max_lr * step / cfg.warmup_steps
+    progress = (step - cfg.warmup_steps) / (cfg.max_steps - cfg.warmup_steps)
+    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
-
+# ================= MAIN TRAIN =================
 def train():
     cfg = LNNConfig()
     set_seed(cfg.seed)
     tokenizer = CharacterTokenizer()
     cfg.vocab_size = tokenizer.vocab_size
     
-    model = LNNForCausalLM(cfg).to(cfg.device)
-    num_params = count_parameters(model)
+    model = LNN(cfg).to(cfg.device)
+    num_params = sum(p.numel() for p in model.parameters())
+    
+    # EXACT OUTPUT HEADERS
+    print(f"Vocabulary size: {cfg.vocab_size} ({tokenizer.unique_count} unique chars + pad)")
     print(f"Model parameters: {num_params:,}")
+    print(f"Effective batch size: {cfg.batch_size * cfg.grad_accum}")
     
-    if num_params > 100000:
-        print("WARNING: Parameters exceed 100k limit!")
-    else:
-        print(f"Model size OK ({num_params} <= 100000)")
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.max_lr, weight_decay=cfg.weight_decay)
+    loader = DataLoader(PackingDataset(tokenizer, cfg), batch_size=cfg.batch_size)
     
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=3e-4, total_steps=cfg.max_steps + 1, pct_start=0.1)
-    
-    loader = DataLoader(TextStream(tokenizer, cfg), batch_size=cfg.batch_size, num_workers=0)
-    pbar = tqdm(loader, total=cfg.max_steps)
+    pbar = tqdm(enumerate(loader), total=cfg.max_steps, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')
     
     model.train()
-    for step, batch in enumerate(pbar):
-        input_ids = batch["input_ids"].to(cfg.device)
-        labels = batch["labels"].to(cfg.device)
+    opt.zero_grad()
+    
+    for step, batch in pbar:
+        # LR Scheduling
+        current_lr = get_lr(cfg, step)
+        for pg in opt.param_groups:
+            pg['lr'] = current_lr
+
+        loss, _ = model(batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device))
+        scaled_loss = loss / cfg.grad_accum
+        scaled_loss.backward()
         
-        opt.zero_grad()
-        
-        if cfg.device == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss, _ = model(input_ids, labels)
-        else:
-            loss, _ = model(input_ids, labels)
-        
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"\n[Step {step}] Loss NaN/Inf - skipping")
-            continue
-        
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        sched.step()
-        
+        if (step + 1) % cfg.grad_accum == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            opt.zero_grad()
+            
+        # Update TQDM postfix to match target exactly
         if step % cfg.log_interval == 0:
-            pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{sched.get_last_lr()[0]:.6f}")
-        
-        if step % cfg.save_interval == 0 and step > 0:
-            sd = os.path.join(cfg.output_dir, f"checkpoint-{step}")
-            os.makedirs(sd, exist_ok=True)
-            torch.save({"step": step, "model_state_dict": model.state_dict(), "config": cfg}, os.path.join(sd, "lnn_model.pt"))
-            print(f"\nSaved checkpoint-{step}")
-        
-        if step >= cfg.max_steps:
+            pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.6f}")
+            
+        if step >= cfg.max_steps: 
             break
-    
-    return model, tokenizer
-
-
-def generate(model, tokenizer, prompt, max_new_tokens=50, temperature=0.8, top_k=40):
-    model.eval()
-    device = next(model.parameters()).device
-    
-    input_ids = tokenizer(prompt, max_length=model.cfg.max_seq_length, truncation=True)["input_ids"].to(device)
-    prompt_len = input_ids.shape[-1]
-    
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            if input_ids.shape[-1] >= model.cfg.max_seq_length:
-                break
-            
-            _, logits = model(input_ids)
-            next_token_logits = logits[:, -1, :] / temperature
-            
-            if top_k > 0:
-                v, _ = torch.topk(next_token_logits, min(top_k, logits.size(-1)))
-                next_token_logits[next_token_logits < v[:, [-1]]] = float('-inf')
-            
-            probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            
-            if next_token.item() == 0:
-                break
-    
-    full_text = tokenizer.decode(input_ids[0].tolist())
-    if len(full_text) > prompt_len:
-        return full_text[prompt_len:]
-    return full_text
-
 
 if __name__ == "__main__":
-    model, tokenizer = train()
-    
-    print("\n--- Testing Generation ---")
-    test_prompts = [
-        "The quick brown",
-        "The Liquid Neural",
-        "Knowledge is",
-        "Practice makes",
-        "Rome was not",
-    ]
-    
-    for prompt in test_prompts:
-        print(f"\nPrompt: '{prompt}'")
-        generated = generate(model, tokenizer, prompt, max_new_tokens=40)
-        print(f"Generated: '{generated}'")
+    train()
