@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# High-Performance Liquid Neural Network with BPE Tokenization (tiktoken)
+
 import os, math, random, torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,130 +8,141 @@ from torch.utils.data import IterableDataset, DataLoader
 from dataclasses import dataclass
 from tqdm import tqdm
 import numpy as np
-import tiktoken  # Standard BPE Tokenizer
+import tiktoken # Run: pip install tiktoken
 
+# ================= CONFIG =================
 @dataclass
 class LNNConfig:
-    hidden_size: int = 256
-    num_layers: int = 4
-    max_seq_length: int = 256  # Increased for better context
-    vocab_size: int = 50257    # GPT-2 Vocab Size
+    hidden_size: int = 512
+    num_layers: int = 8
+    num_heads: int = 8
+    max_seq_length: int = 256  # BPE holds ~4x more info than chars, so 256 is plenty
+    vocab_size: int = 50257    # GPT-2/tiktoken standard
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size: int = 8        # Adjusted for BPE
+    batch_size: int = 4
+    grad_accum: int = 4
     max_steps: int = 10000
-    save_interval: int = 5000
-    log_interval: int = 100
-    output_dir: str = "./output_lnn_bpe"
+    log_interval: int = 10
+    eval_interval: int = 500
+    warmup_steps: int = 500
+    max_lr: float = 3e-4
+    min_lr: float = 3e-5
+    weight_decay: float = 0.1
+    label_smoothing: float = 0.05
 
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-# --- Components ---
-
+# ================= CORE COMPONENTS =================
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.g = nn.Parameter(torch.ones(dim))
         self.eps = eps
-    
+
     def forward(self, x):
         norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return x * norm * self.g
 
-class LiquidCell(nn.Module):
-    """
-    Implements a Liquid Neural Network cell where the state 
-    update is gated by the input's 'fluidity'.
-    """
-    def __init__(self, dim):
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=2048):
         super().__init__()
-        self.gate = nn.Linear(dim, dim)
-        self.W = nn.Linear(dim, dim)
-        self.U = nn.Linear(dim, dim)
-        self.alpha = nn.Parameter(torch.tensor(0.1))
-    
-    def forward(self, x, h):
-        # The 'Liquid' gating mechanism
-        inter_gate = torch.sigmoid(self.gate(x) + self.alpha)
-        dh = torch.tanh(self.W(x) + self.U(h))
-        return h + inter_gate * dh * 0.1
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+        self.build_cache(max_seq_len)
+
+    def build_cache(self, seq_len):
+        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer('cos', emb.cos()[None, None, :, :])
+        self.register_buffer('sin', emb.sin()[None, None, :, :])
+
+    def forward(self, L):
+        return self.cos[:, :, :L], self.sin[:, :, :L]
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
 
 class CausalAttention(nn.Module):
-    def __init__(self, dim, num_heads=4):
+    def __init__(self, dim, heads):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.heads = heads
+        self.head_dim = dim // heads
         self.scale = self.head_dim ** -0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.proj = nn.Linear(dim, dim)
-    
+        self.rope = RotaryEmbedding(self.head_dim)
+
     def forward(self, x):
         B, L, D = x.shape
-        q, k, v = self.qkv(x).split(D, dim=-1)
-        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(B, L, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, L, self.heads, self.head_dim).transpose(1, 2)
+        
+        cos, sin = self.rope(L)
+        q = (q * cos) + (rotate_half(q) * sin)
+        k = (k * cos) + (rotate_half(k) * sin)
         
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), 1)
+        mask = torch.triu(torch.ones(L, L, device=x.device), 1).bool()
         attn = attn.masked_fill(mask, float('-inf'))
         attn = F.softmax(attn, dim=-1)
-        
         return self.proj((attn @ v).transpose(1, 2).reshape(B, L, D))
 
-class LiquidBlock(nn.Module):
+class LiquidCell(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.attn = CausalAttention(dim)
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.W = nn.Linear(dim, dim)
+        self.U = nn.Linear(dim, dim)
+
+    def forward(self, x, h):
+        g = torch.sigmoid(self.alpha)
+        dh = torch.tanh(self.W(x) + self.U(h))
+        return h + g * dh * 0.1
+
+class Block(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.attn = CausalAttention(dim, heads)
         self.liquid = LiquidCell(dim)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim)
+            nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim)
         )
-        self.ln1 = RMSNorm(dim)
-        self.ln2 = RMSNorm(dim)
-        self.ln3 = RMSNorm(dim)
-    
+        self.ln1, self.ln2, self.ln3 = RMSNorm(dim), RMSNorm(dim), RMSNorm(dim)
+
     def forward(self, x, h):
         h = self.liquid(self.ln1(x), h)
         x = x + self.attn(self.ln2(x))
         x = x + self.mlp(self.ln3(h))
         return x, h
 
-class LNNForCausalLM(nn.Module):
+class LNN(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.pos_emb = nn.Parameter(torch.zeros(1, cfg.max_seq_length, cfg.hidden_size))
-        self.blocks = nn.ModuleList([LiquidBlock(cfg.hidden_size) for _ in range(cfg.num_layers)])
-        self.ln_f = RMSNorm(cfg.hidden_size)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        self.tok_emb.weight = self.lm_head.weight # Weight tying
-        
+        self.emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.blocks = nn.ModuleList([Block(cfg.hidden_size, cfg.num_heads) for _ in range(cfg.num_layers)])
+        self.ln = RMSNorm(cfg.hidden_size)
+        self.head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.emb.weight = self.head.weight # Weight Tying
+
     def forward(self, ids, labels=None):
-        B, L = ids.shape
-        x = self.tok_emb(ids) + self.pos_emb[:, :L, :]
+        x = self.emb(ids)
+        h = x
+        for b in self.blocks: x, h = b(x, h)
+        logits = self.head(self.ln(x))
         
-        h = torch.zeros_like(x) # Initial hidden state
-        for block in self.blocks:
-            x, h = block(x, h)
-        
-        logits = self.lm_head(self.ln_f(x))
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+            shift_logits = logits[:, :-1].reshape(-1, self.cfg.vocab_size)
+            shift_labels = labels[:, 1:].reshape(-1)
+            loss = F.cross_entropy(shift_logits, shift_labels, label_smoothing=self.cfg.label_smoothing)
         return loss, logits
 
-# --- Data ---
-
-class TextStream(IterableDataset):
+# ================= BPE DATASET =================
+class BPEStream(IterableDataset):
     def __init__(self, cfg):
         self.cfg = cfg
         self.enc = tiktoken.get_encoding("gpt2")
@@ -137,60 +150,77 @@ class TextStream(IterableDataset):
     def __iter__(self):
         from datasets import load_dataset
         ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-        for x in ds:
+        for x in ds.shuffle(buffer_size=1000, seed=self.cfg.seed):
             tokens = self.enc.encode_ordinary(x["text"])
-            for i in range(0, len(tokens) - self.cfg.max_seq_length, self.cfg.max_seq_length):
-                chunk = tokens[i:i + self.cfg.max_seq_length + 1]
-                if len(chunk) < self.cfg.max_seq_length + 1: continue
-                yield {
-                    "input_ids": torch.tensor(chunk[:-1]),
-                    "labels": torch.tensor(chunk[1:])
-                }
+            # Ensure sequence length fits config
+            if len(tokens) > self.cfg.max_seq_length:
+                tokens = tokens[:self.cfg.max_seq_length]
+            else:
+                # Simple padding if text is too short
+                tokens += [0] * (self.cfg.max_seq_length - len(tokens))
+                
+            ids = torch.tensor(tokens, dtype=torch.long)
+            yield {"input_ids": ids, "labels": ids.clone()}
 
-# --- Generation ---
-
-def generate(model, prompt, max_new_tokens=30, temperature=0.7):
+# ================= GENERATION =================
+def generate(model, prompt, max_new_tokens=30, temperature=0.8, top_k=40):
     model.eval()
     enc = tiktoken.get_encoding("gpt2")
-    ids = torch.tensor(enc.encode(prompt)).unsqueeze(0).to(model.cfg.device)
-    
+    ids = torch.tensor(enc.encode(prompt), dtype=torch.long).unsqueeze(0).to(model.cfg.device)
+
     for _ in range(max_new_tokens):
-        input_ids = ids[:, -model.cfg.max_seq_length:]
+        cond_ids = ids[:, -model.cfg.max_seq_length:]
         with torch.no_grad():
-            _, logits = model(input_ids)
+            _, logits = model(cond_ids)
             logits = logits[:, -1, :] / temperature
-            # Simple Top-K filtering
-            v, _ = torch.topk(logits, 50)
-            logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = float('-inf')
+            
             probs = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             ids = torch.cat([ids, next_id], dim=-1)
             
     return enc.decode(ids[0].tolist())
 
-# --- Training Loop ---
+# ================= TRAINING =================
+def get_lr(cfg, step):
+    if step < cfg.warmup_steps: return cfg.max_lr * step / cfg.warmup_steps
+    progress = (step - cfg.warmup_steps) / (cfg.max_steps - cfg.warmup_steps)
+    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
-if __name__ == "__main__":
+def train():
     cfg = LNNConfig()
-    set_seed(cfg.seed)
-    model = LNNForCausalLM(cfg).to(cfg.device)
+    model = LNN(cfg).to(cfg.device)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.max_lr, weight_decay=cfg.weight_decay)
+    loader = DataLoader(BPEStream(cfg), batch_size=cfg.batch_size)
+    
+    print(f"BPE Vocab Size: {cfg.vocab_size}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    opt = torch.optim.AdamW(model.parameters(), lr=4e-4, weight_decay=0.01)
-    loader = DataLoader(TextStream(cfg), batch_size=cfg.batch_size)
     
     pbar = tqdm(enumerate(loader), total=cfg.max_steps)
+    model.train()
+    
     for step, batch in pbar:
-        loss, _ = model(batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device))
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        opt.zero_grad()
+        lr = get_lr(cfg, step)
+        for pg in opt.param_groups: pg['lr'] = lr
         
+        loss, _ = model(batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device))
+        (loss / cfg.grad_accum).backward()
+        
+        if (step + 1) % cfg.grad_accum == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            opt.zero_grad()
+            
         if step % cfg.log_interval == 0:
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.6f}")
+            
+        if step % cfg.eval_interval == 0 and step > 0:
+            print(f"\nPrompt: 'Liquid networks are' -> {generate(model, 'Liquid networks are')}")
+            model.train()
         
         if step >= cfg.max_steps: break
 
-    print("\n--- Final Test ---")
-    print(generate(model, "The scientific method is"))
+if __name__ == "__main__":
+    train()
