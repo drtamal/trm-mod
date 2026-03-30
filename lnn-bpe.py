@@ -14,7 +14,7 @@ import tiktoken
 # ================= CONFIG =================
 @dataclass
 class LNNConfig:
-    hidden_size: int = 192
+    hidden_size: int = 384
     num_layers: int = 8
     num_heads: int = 8
     max_seq_length: int = 256
@@ -23,9 +23,9 @@ class LNNConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size: int = 4
     grad_accum: int = 4
-    max_steps: int = 100000
+    max_steps: int = 300000
     log_interval: int = 10
-    eval_interval: int = 10000
+    eval_interval: int = 30000
     warmup_steps: int = 500
     max_lr: float = 3e-4
     min_lr: float = 3e-5
