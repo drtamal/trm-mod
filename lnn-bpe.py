@@ -130,19 +130,34 @@ class LNN(nn.Module):
         return loss, logits
 
 # ================= DATASET =================
+# ================= DATASET (STABLE VERSION) =================
 class BPEStream(IterableDataset):
     def __init__(self, cfg):
         self.cfg = cfg
         self.enc = tiktoken.get_encoding("gpt2")
-    def __iter__(self):
+        
+        # DOWNLOAD LOCALLY ONCE
         from datasets import load_dataset
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-        for x in ds.shuffle(buffer_size=1000, seed=self.cfg.seed):
+        print("Loading/Downloading dataset to local cache...")
+        # This will download the data once to your /data/ folder
+        self.ds = load_dataset(
+            "HuggingFaceFW/fineweb-edu", 
+            name="sample-10BT", 
+            split="train", 
+            streaming=False # Change to False for local stability
+        ).select(range(500000)) # Take a large enough slice for 300k steps
+
+    def __iter__(self):
+        # Shuffle the local copy
+        shuffled_ds = self.ds.shuffle(seed=self.cfg.seed)
+        for x in shuffled_ds:
             tokens = self.enc.encode_ordinary(x["text"])
-            if len(tokens) > self.cfg.max_seq_length: tokens = tokens[:self.cfg.max_seq_length]
-            else: tokens += [0] * (self.cfg.max_seq_length - len(tokens))
-            ids = torch.tensor(tokens, dtype=torch.long)
-            yield {"input_ids": ids, "labels": ids.clone()}
+            if len(tokens) > self.cfg.max_seq_length:
+                tokens = tokens[:self.cfg.max_seq_length]
+            else:
+                tokens += [0] * (self.cfg.max_seq_length - len(tokens))
+            yield {"input_ids": torch.tensor(tokens, dtype=torch.long), 
+                   "labels": torch.tensor(tokens, dtype=torch.long)}
 
 # ================= GENERATION & EVAL =================
 def generate(model, prompt, max_new_tokens=40, temperature=0.8, top_k=40):
