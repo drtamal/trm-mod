@@ -8,6 +8,7 @@ from torch.utils.data import IterableDataset, DataLoader
 from dataclasses import dataclass
 from tqdm import tqdm
 import numpy as np
+os.environ["TIKTOKEN_CACHE_DIR"] = "/data/aicoe_gpu/komal_paul_gtg/tiktoken_cache"
 import tiktoken 
 
 # ================= CONFIG =================
