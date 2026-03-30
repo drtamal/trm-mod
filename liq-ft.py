@@ -5,15 +5,16 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from dataclasses import dataclass
 from tqdm import tqdm
+import tiktoken
 
-# ================= CONFIG (FINE-TUNING) =================
+# ================= CONFIG (MATCHES YOUR TRAINED MODEL) =================
 @dataclass
 class SFTConfig:
-    hidden_size: int = 768     # Matches your 35M parameter model
-    num_layers: int = 12
-    num_heads: int = 12
+    hidden_size: int = 128     # Fixed to match the checkpoint!
+    num_layers: int = 4        # Fixed to match the checkpoint!
+    num_heads: int = 8         # Assuming 4 heads for a dim of 128
     max_seq_length: int = 256
-    char_vocab_size: int = 256
+    vocab_size: int = 50257    # Back to BPE vocab size
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -22,7 +23,7 @@ class SFTConfig:
     grad_accum: int = 2
     max_steps: int = 15000     
     log_interval: int = 10
-    eval_interval: int = 1000
+    eval_interval: int = 500
     
     max_lr: float = 5e-5       
     min_lr: float = 5e-6
@@ -32,24 +33,7 @@ class SFTConfig:
     base_model: str = "lnn_final_model.pt"
     output_model: str = "lnn_chat_assistant.pt"
 
-# ================= MODEL ARCHITECTURE =================
-class CharCNNEmbedding(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.char_emb = nn.Embedding(cfg.char_vocab_size, 64)
-        self.conv1 = nn.Conv1d(64, 256, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(256, 256, kernel_size=5, padding=2)
-        self.ln = nn.LayerNorm(256)
-        self.projection = nn.Linear(256, cfg.hidden_size)
-
-    def forward(self, x):
-        x = self.char_emb(x).transpose(1, 2) 
-        feat = F.gelu(self.conv1(x))
-        feat = F.gelu(self.conv2(feat))
-        x = feat.transpose(1, 2) 
-        x = self.ln(x)
-        return self.projection(x)
-
+# ================= BPE MODEL ARCHITECTURE =================
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
@@ -124,50 +108,55 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln3(h))
         return x, h
 
-class LNN_Hybrid(nn.Module):
+class LNN(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.front_end = CharCNNEmbedding(cfg)
+        self.emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.blocks = nn.ModuleList([Block(cfg.hidden_size, cfg.num_heads) for _ in range(cfg.num_layers)])
         self.ln = RMSNorm(cfg.hidden_size)
-        self.head = nn.Linear(cfg.hidden_size, cfg.char_vocab_size, bias=False)
+        self.head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.emb.weight = self.head.weight # Weight tying
 
     def forward(self, ids, labels=None):
-        x = self.front_end(ids)
+        x = self.emb(ids)
         h = x
         for b in self.blocks: x, h = b(x, h)
         logits = self.head(self.ln(x))
         
         loss = None
         if labels is not None:
-            shift_logits = logits[:, :-1].reshape(-1, self.cfg.char_vocab_size)
+            shift_logits = logits[:, :-1].reshape(-1, self.cfg.vocab_size)
             shift_labels = labels[:, 1:].reshape(-1)
-            loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=0, label_smoothing=self.cfg.label_smoothing)
+            loss = F.cross_entropy(shift_logits, shift_labels, label_smoothing=self.cfg.label_smoothing)
         return loss, logits
 
-# ================= CHAT DATASET =================
-class ChatStream(IterableDataset):
+# ================= BPE CHAT DATASET =================
+class BPEChatStream(IterableDataset):
     def __init__(self, cfg):
         self.cfg = cfg
+        self.enc = tiktoken.get_encoding("gpt2")
         
     def __iter__(self):
         from datasets import load_dataset
-        ds = load_dataset("daily_dialog", split="train", streaming=True)
+        # Alpaca is a modern Parquet dataset, it will NEVER throw the script error
+        ds = load_dataset("tatsu-lab/alpaca", split="train", streaming=True)
         
         for x in ds.shuffle(buffer_size=1000, seed=self.cfg.seed):
-            dialogue = x["dialog"]
-            formatted_chat = ""
+            # 1. Get the user's prompt
+            user_text = x["instruction"]
+            if x["input"]: # Sometimes there is extra context
+                user_text += f"\n{x['input']}"
             
-            for i, turn in enumerate(dialogue):
-                if i % 2 == 0:
-                    formatted_chat += f"<|user|>\n{turn.strip()}\n"
-                else:
-                    formatted_chat += f"<|bot|>\n{turn.strip()}\n<|end|>\n"
+            # 2. Get the AI's response
+            bot_text = x["output"]
             
-            bytes_data = formatted_chat.encode('utf-8')
-            tokens = [min(b, 255) for b in bytes_data]
+            # 3. Format into our Chat Template
+            formatted_chat = f"<|user|>\n{user_text}\n<|bot|>\n{bot_text}\n<|end|>\n"
             
+            tokens = self.enc.encode_ordinary(formatted_chat)
+            
+            # Truncate or Pad
             if len(tokens) > self.cfg.max_seq_length:
                 tokens = tokens[-self.cfg.max_seq_length:]
             else:
@@ -176,14 +165,14 @@ class ChatStream(IterableDataset):
             ids = torch.tensor(tokens, dtype=torch.long)
             yield {"input_ids": ids, "labels": ids.clone()}
 
-# ================= GENERATION =================
-def chat_generate(model, prompt, max_new_tokens=150, temperature=0.7):
+# ================= BPE GENERATION =================
+def chat_generate(model, prompt, max_new_tokens=100, temperature=0.7):
     model.eval()
+    enc = tiktoken.get_encoding("gpt2")
     formatted_prompt = f"<|user|>\n{prompt}\n<|bot|>\n"
-    input_bytes = list(formatted_prompt.encode('utf-8'))
-    ids = torch.tensor(input_bytes, dtype=torch.long).unsqueeze(0).to(model.cfg.device)
+    ids = torch.tensor(enc.encode(formatted_prompt), dtype=torch.long).unsqueeze(0).to(model.cfg.device)
     
-    generated = []
+    generated_tokens = []
     for _ in range(max_new_tokens):
         with torch.no_grad():
             _, logits = model(ids[:, -model.cfg.max_seq_length:])
@@ -192,13 +181,14 @@ def chat_generate(model, prompt, max_new_tokens=150, temperature=0.7):
             next_id = torch.multinomial(probs, num_samples=1)
             
             ids = torch.cat([ids, next_id], dim=-1)
-            generated.append(next_id.item())
+            generated_tokens.append(next_id.item())
             
-            current_text = bytes([b for b in generated if 0 < b < 256]).decode('utf-8', errors='ignore')
+            # Check for stop token
+            current_text = enc.decode(generated_tokens)
             if "<|end|>" in current_text:
                 return current_text.replace("<|end|>", "").strip()
                 
-    return bytes([b for b in generated if 0 < b < 256]).decode('utf-8', errors='ignore').strip()
+    return enc.decode(generated_tokens).strip()
 
 # ================= SFT TRAINING LOOP =================
 def get_lr(cfg, step):
@@ -207,17 +197,14 @@ def get_lr(cfg, step):
 
 def finetune():
     cfg = SFTConfig()
-    model = LNN_Hybrid(cfg).to(cfg.device)
+    model = LNN(cfg).to(cfg.device)
     
-    if os.path.exists(cfg.base_model):
-        print(f"Loading Base Knowledge from {cfg.base_model}...")
-        model.load_state_dict(torch.load(cfg.base_model, map_location=cfg.device))
-    else:
-        print(f"ERROR: Could not find {cfg.base_model}. Cannot fine-tune.")
-        return
+    print(f"Loading Base Knowledge from {cfg.base_model}...")
+    model.load_state_dict(torch.load(cfg.base_model, map_location=cfg.device))
+    print("Model Loaded successfully!")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.max_lr, weight_decay=cfg.weight_decay)
-    loader = DataLoader(ChatStream(cfg), batch_size=cfg.batch_size)
+    loader = DataLoader(BPEChatStream(cfg), batch_size=cfg.batch_size)
     
     print("\nStarting Supervised Fine-Tuning (SFT) for Chat...")
     pbar = tqdm(enumerate(loader), total=cfg.max_steps)
@@ -225,8 +212,7 @@ def finetune():
     
     for step, batch in pbar:
         lr = get_lr(cfg, step)
-        for pg in opt.param_groups: 
-            pg['lr'] = lr
+        for pg in opt.param_groups: pg['lr'] = lr
             
         loss, _ = model(batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device))
         (loss / cfg.grad_accum).backward()
@@ -244,8 +230,7 @@ def finetune():
             print(f"[Test Chat] LNN: {chat_generate(model, 'How is the weather today?')}")
             model.train()
         
-        if step >= cfg.max_steps: 
-            break
+        if step >= cfg.max_steps: break
 
     torch.save(model.state_dict(), cfg.output_model)
     print(f"\nSFT Complete! Assistant saved as {cfg.output_model}")
