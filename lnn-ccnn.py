@@ -33,31 +33,24 @@ class LNNConfig:
 
 # ================= HYBRID FRONT-END =================
 class CharCNNEmbedding(nn.Module):
-    """
-    Replaces the massive BPE table. 
-    Uses characters to build 'word-like' representations.
-    """
     def __init__(self, cfg):
         super().__init__()
-        self.char_emb = nn.Embedding(cfg.char_vocab_size, 32)
-        # Kernels to capture different n-gram lengths (spelling patterns)
+        # We use a larger embedding for characters to give the CNN more to work with
+        self.char_emb = nn.Embedding(cfg.char_vocab_size, 64) 
         self.convolutions = nn.ModuleList([
-            nn.Conv1d(32, 64, kernel_size=k, padding=k//2) for k in [3, 5, 7]
+            nn.Conv1d(64, 128, kernel_size=k, padding=k//2) for k in [3, 5, 7]
         ])
-        self.highway = nn.Linear(192, 192) # Gating mechanism
-        self.projection = nn.Linear(192, cfg.hidden_size)
+        # Add Batchnorm to prevent the "0.4740" flat loss
+        self.bn = nn.BatchNorm1d(384) 
+        self.projection = nn.Linear(384, cfg.hidden_size)
 
     def forward(self, x):
-        # x: [Batch, Seq_Len]
-        x = self.char_emb(x).transpose(1, 2) # [B, 32, L]
+        # Normalize input to 0-1 range to help the embedding layer
+        x = self.char_emb(x).transpose(1, 2) # [B, 64, L]
         
-        # Extract features across kernels
-        cnn_features = [torch.relu(conv(x)) for conv in self.convolutions]
-        x = torch.cat(cnn_features, dim=1).transpose(1, 2) # [B, L, 192]
-        
-        # Highway Gating
-        g = torch.sigmoid(self.highway(x))
-        x = g * x + (1 - g) * x # Simplified Highway
+        # Extract features
+        x = torch.cat([F.silu(conv(x)) for conv in self.convolutions], dim=1)
+        x = self.bn(x).transpose(1, 2)
         return self.projection(x)
 
 # ================= CORE COMPONENTS =================
@@ -179,21 +172,25 @@ class CharStream(IterableDataset):
             yield {"input_ids": ids, "labels": ids.clone()}
 
 # ================= GENERATION & EVAL =================
-def generate(model, prompt, max_new_tokens=100):
+def generate(model, prompt, max_new_tokens=60, temperature=0.7):
     model.eval()
-    # Convert prompt to bytes
-    ids = [min(b, 255) for b in prompt.encode('utf-8')]
-    ids = torch.tensor(ids, dtype=torch.long).unsqueeze(0).to(model.cfg.device)
+    # Convert string to list of bytes
+    input_ids = list(prompt.encode('utf-8'))
+    ids = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0).to(model.cfg.device)
     
+    generated_bytes = input_ids
     for _ in range(max_new_tokens):
         with torch.no_grad():
             _, logits = model(ids[:, -model.cfg.max_seq_length:])
-            next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            # Apply temperature sampling instead of argmax
+            probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            
             ids = torch.cat([ids, next_id], dim=-1)
-    
-    # Decode bytes back to string
-    byte_list = ids[0].tolist()
-    return bytes([b for b in byte_list if b > 0]).decode('utf-8', errors='replace')
+            generated_bytes.append(next_id.item())
+            
+    # Decode with 'ignore' to prevent crashes on half-learned UTF-8
+    return bytes([b for b in generated_bytes if 0 < b < 256]).decode('utf-8', errors='ignore')
 
 def train():
     cfg = LNNConfig()
