@@ -130,34 +130,73 @@ class LNN(nn.Module):
         return loss, logits
 
 # ================= DATASET =================
-# ================= DATASET (STABLE VERSION) =================
+# ================= DATASET (ONLINE STREAMING MODE) =================
 class BPEStream(IterableDataset):
     def __init__(self, cfg):
         self.cfg = cfg
         self.enc = tiktoken.get_encoding("gpt2")
         
-        # DOWNLOAD LOCALLY ONCE
+    def __iter__(self):
         from datasets import load_dataset
-        print("Loading/Downloading dataset to local cache...")
-        # This will download the data once to your /data/ folder
-        self.ds = load_dataset(
+        
+        # 1. Load the dataset in streaming mode (Online)
+        # 'sample-10BT' is a massive 10 Billion Token subset of FineWeb-Edu
+        ds = load_dataset(
             "HuggingFaceFW/fineweb-edu", 
             name="sample-10BT", 
             split="train", 
-            streaming=False # Change to False for local stability
-        ).select(range(500000)) # Take a large enough slice for 300k steps
-
-    def __iter__(self):
-        # Shuffle the local copy
-        shuffled_ds = self.ds.shuffle(seed=self.cfg.seed)
+            streaming=True
+        )
+        
+        # 2. Shuffle the stream using a local buffer
+        # This prevents the model from seeing repetitive topics from the same file
+        shuffled_ds = ds.shuffle(buffer_size=10000, seed=self.cfg.seed)
+        
         for x in shuffled_ds:
+            # Tokenize the online text on-the-fly
             tokens = self.enc.encode_ordinary(x["text"])
+            
+            # Handle sequence length (Truncate or Pad)
             if len(tokens) > self.cfg.max_seq_length:
-                tokens = tokens[:self.cfg.max_seq_length]
+                # Take a random slice of the text if it's very long
+                start_idx = random.randint(0, len(tokens) - self.cfg.max_seq_length)
+                tokens = tokens[start_idx : start_idx + self.cfg.max_seq_length]
             else:
                 tokens += [0] * (self.cfg.max_seq_length - len(tokens))
-            yield {"input_ids": torch.tensor(tokens, dtype=torch.long), 
-                   "labels": torch.tensor(tokens, dtype=torch.long)}
+            
+            yield {
+                "input_ids": torch.tensor(tokens, dtype=torch.long),
+                "labels": torch.tensor(tokens, dtype=torch.long)
+            }
+
+# ================= DATASET (STABLE VERSION) =================
+#class BPEStream(IterableDataset):
+#    def __init__(self, cfg):
+#        self.cfg = cfg
+#        self.enc = tiktoken.get_encoding("gpt2")
+        
+#        # DOWNLOAD LOCALLY ONCE
+#        from datasets import load_dataset
+#        print("Loading/Downloading dataset to local cache...")
+        # This will download the data once to your /data/ folder
+#        self.ds = load_dataset(
+#            "HuggingFaceFW/fineweb-edu", 
+#            name="sample-10BT", 
+#            split="train", 
+#            streaming=False # Change to False for local stability
+#        ).select(range(500000)) # Take a large enough slice for 300k steps
+
+#    def __iter__(self):
+        # Shuffle the local copy
+#        shuffled_ds = self.ds.shuffle(seed=self.cfg.seed)
+#        for x in shuffled_ds:
+#            tokens = self.enc.encode_ordinary(x["text"])
+#            if len(tokens) > self.cfg.max_seq_length:
+#                tokens = tokens[:self.cfg.max_seq_length]
+#            else:
+#                tokens += [0] * (self.cfg.max_seq_length - len(tokens))
+#            yield {"input_ids": torch.tensor(tokens, dtype=torch.long), 
+#                   "labels": torch.tensor(tokens, dtype=torch.long)}
 
 # ================= GENERATION & EVAL =================
 def generate(model, prompt, max_new_tokens=40, temperature=0.8, top_k=40):
