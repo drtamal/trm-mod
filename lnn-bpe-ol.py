@@ -138,28 +138,69 @@ class LNN(nn.Module):
         return loss, logits
 
 # ================= DATASET =================
+import time
+import requests
+from datasets.exceptions import DatasetGenerationError
+
+# ================= DATASET (RETRY-ENABLED STREAMING) =================
 class BPEStream(IterableDataset):
     def __init__(self, cfg):
         self.cfg = cfg
         self.enc = tiktoken.get_encoding("gpt2")
-        
+        self.max_retries = 10  # Number of times to try before giving up
+        self.retry_delay = 5   # Initial seconds to wait between retries
+
     def __iter__(self):
         from datasets import load_dataset
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-        shuffled_ds = ds.shuffle(buffer_size=10000, seed=self.cfg.seed)
         
-        for x in shuffled_ds:
-            tokens = self.enc.encode_ordinary(x["text"])
-            if len(tokens) > self.cfg.max_seq_length:
-                start_idx = random.randint(0, len(tokens) - self.cfg.max_seq_length)
-                tokens = tokens[start_idx : start_idx + self.cfg.max_seq_length]
-            else:
-                tokens += [0] * (self.cfg.max_seq_length - len(tokens))
-            
-            yield {
-                "input_ids": torch.tensor(tokens, dtype=torch.long),
-                "labels": torch.tensor(tokens, dtype=torch.long)
-            }
+        attempt = 0
+        while attempt < self.max_retries:
+            try:
+                # 1. Attempt to connect and stream
+                ds = load_dataset(
+                    "HuggingFaceFW/fineweb-edu", 
+                    name="sample-10BT", 
+                    split="train", 
+                    streaming=True
+                )
+                
+                # Apply shuffling
+                shuffled_ds = ds.shuffle(buffer_size=10000, seed=self.cfg.seed + attempt)
+                
+                print(f"Network Check: Stream established (Attempt {attempt+1})")
+                
+                for x in shuffled_ds:
+                    try:
+                        tokens = self.enc.encode_ordinary(x["text"])
+                        
+                        if len(tokens) > self.cfg.max_seq_length:
+                            start_idx = random.randint(0, len(tokens) - self.cfg.max_seq_length)
+                            tokens = tokens[start_idx : start_idx + self.cfg.max_seq_length]
+                        else:
+                            tokens += [0] * (self.cfg.max_seq_length - len(tokens))
+                        
+                        yield {
+                            "input_ids": torch.tensor(tokens, dtype=torch.long),
+                            "labels": torch.tensor(tokens, dtype=torch.long)
+                        }
+                    except Exception as e:
+                        # Catch individual sample errors (e.g., corrupted shard)
+                        print(f"\nWarning: Skipping corrupted sample. Error: {e}")
+                        continue
+                
+                # If we finish the dataset naturally, exit the while loop
+                break
+
+            except (requests.exceptions.RequestException, DatasetGenerationError, ConnectionError, RuntimeError) as e:
+                attempt += 1
+                wait_time = self.retry_delay * (2 ** (attempt - 1)) # Exponential backoff
+                print(f"\n[NETWORK ERROR]: {e}")
+                print(f"Retrying in {wait_time} seconds... ({attempt}/{self.max_retries})")
+                time.sleep(wait_time)
+        
+        if attempt >= self.max_retries:
+            print("\nFATAL: Maximum network retries reached. Check your internet connection.")
+            raise ConnectionError("Could not recover stream after multiple attempts.")
 
 # ================= GENERATION & EVAL =================
 def generate(model, prompt, max_new_tokens=40, temperature=0.8, top_k=40):
