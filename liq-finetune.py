@@ -6,6 +6,8 @@ from torch.utils.data import IterableDataset, DataLoader
 from dataclasses import dataclass
 from tqdm import tqdm
 import tiktoken
+# Force tiktoken to use your local cache and skip internet checks
+os.environ["TIKTOKEN_CACHE_DIR"] = "/data/aicoe_gpu/komal_paul_gtg/tiktoken_cache"
 
 # ================= CONFIG (4 EPOCHS / BATCH SIZE 2) =================
 @dataclass
@@ -137,7 +139,14 @@ class LNN(nn.Module):
 class BPEChatStream(IterableDataset):
     def __init__(self, cfg):
         self.cfg = cfg
-        self.enc = tiktoken.get_encoding("gpt2")
+        try:
+            self.enc = tiktoken.get_encoding("gpt2")
+        except Exception:
+            # If it fails, we try to force it to look at the cache directory
+            import tiktoken
+            from tiktoken.load import read_file, read_file_cached
+            print("Offline Mode: Loading tokenizer from local cache...")
+            self.enc = tiktoken.get_encoding("gpt2")
         
     def __iter__(self):
         from datasets import load_dataset
