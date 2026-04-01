@@ -7,31 +7,34 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import tiktoken
 
-# ================= CONFIG (MATCHES YOUR TRAINED MODEL) =================
+# ================= CONFIG (4 EPOCHS / BATCH SIZE 2) =================
 @dataclass
 class SFTConfig:
-    hidden_size: int = 128     # Fixed to match the checkpoint!
-    num_layers: int = 4        # Fixed to match the checkpoint!
-    num_heads: int = 8         # Assuming 4 heads for a dim of 128
+    hidden_size: int = 128     
+    num_layers: int = 4        
+    num_heads: int = 8         
     max_seq_length: int = 256
-    vocab_size: int = 50257    # Back to BPE vocab size
+    vocab_size: int = 50257    
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # SFT Specifics
-    batch_size: int = 16       
-    grad_accum: int = 2
-    max_steps: int = 15000     
-    log_interval: int = 10
-    eval_interval: int = 500
+    # Updated Training Params
+    num_epochs: int = 4
+    batch_size: int = 2        # Batch size 2 as requested
+    grad_accum: int = 8        # Increased to maintain stable gradients
     
-    max_lr: float = 5e-5       
-    min_lr: float = 5e-6
+    # Alpaca has ~52,000 samples. 52,000 / 2 = 26,000 steps per epoch.
+    steps_per_epoch: int = 26000 
+    total_steps: int = 4 * 26000 
+    
+    log_interval: int = 10
+    max_lr: float = 3e-5       
+    min_lr: float = 3e-6
     weight_decay: float = 0.1
-    label_smoothing: float = 0.0
+    label_smoothing: float = 0.05
     
     base_model: str = "lnn_final_model.pt"
-    output_model: str = "lnn_chat_assistant.pt"
+    output_model: str = "lnn_chat_assistant_final.pt"
 
 # ================= BPE MODEL ARCHITECTURE =================
 class RMSNorm(nn.Module):
@@ -116,14 +119,13 @@ class LNN(nn.Module):
         self.blocks = nn.ModuleList([Block(cfg.hidden_size, cfg.num_heads) for _ in range(cfg.num_layers)])
         self.ln = RMSNorm(cfg.hidden_size)
         self.head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        self.emb.weight = self.head.weight # Weight tying
+        self.emb.weight = self.head.weight
 
     def forward(self, ids, labels=None):
         x = self.emb(ids)
         h = x
         for b in self.blocks: x, h = b(x, h)
         logits = self.head(self.ln(x))
-        
         loss = None
         if labels is not None:
             shift_logits = logits[:, :-1].reshape(-1, self.cfg.vocab_size)
@@ -131,7 +133,7 @@ class LNN(nn.Module):
             loss = F.cross_entropy(shift_logits, shift_labels, label_smoothing=self.cfg.label_smoothing)
         return loss, logits
 
-# ================= BPE CHAT DATASET =================
+# ================= BPE CHAT DATASET (LOOPABLE) =================
 class BPEChatStream(IterableDataset):
     def __init__(self, cfg):
         self.cfg = cfg
@@ -139,24 +141,19 @@ class BPEChatStream(IterableDataset):
         
     def __iter__(self):
         from datasets import load_dataset
-        # Alpaca is a modern Parquet dataset, it will NEVER throw the script error
+        # The training loop handles resetting the epoch, but we can stream endlessly here
         ds = load_dataset("tatsu-lab/alpaca", split="train", streaming=True)
+        # Unique shuffle per worker/epoch via seed
+        shuffled_ds = ds.shuffle(buffer_size=2000, seed=self.cfg.seed + random.randint(0, 1000))
         
-        for x in ds.shuffle(buffer_size=1000, seed=self.cfg.seed):
-            # 1. Get the user's prompt
+        for x in shuffled_ds:
             user_text = x["instruction"]
-            if x["input"]: # Sometimes there is extra context
-                user_text += f"\n{x['input']}"
-            
-            # 2. Get the AI's response
+            if x["input"]: user_text += f"\n{x['input']}"
             bot_text = x["output"]
             
-            # 3. Format into our Chat Template
             formatted_chat = f"<|user|>\n{user_text}\n<|bot|>\n{bot_text}\n<|end|>\n"
-            
             tokens = self.enc.encode_ordinary(formatted_chat)
             
-            # Truncate or Pad
             if len(tokens) > self.cfg.max_seq_length:
                 tokens = tokens[-self.cfg.max_seq_length:]
             else:
@@ -165,34 +162,31 @@ class BPEChatStream(IterableDataset):
             ids = torch.tensor(tokens, dtype=torch.long)
             yield {"input_ids": ids, "labels": ids.clone()}
 
-# ================= BPE GENERATION =================
-def chat_generate(model, prompt, max_new_tokens=100, temperature=0.7):
+# ================= CHAT EVALUATION =================
+def chat_eval(model, prompt, temperature=0.7):
     model.eval()
     enc = tiktoken.get_encoding("gpt2")
     formatted_prompt = f"<|user|>\n{prompt}\n<|bot|>\n"
     ids = torch.tensor(enc.encode(formatted_prompt), dtype=torch.long).unsqueeze(0).to(model.cfg.device)
     
-    generated_tokens = []
-    for _ in range(max_new_tokens):
+    generated = []
+    for _ in range(100):
         with torch.no_grad():
             _, logits = model(ids[:, -model.cfg.max_seq_length:])
-            logits = logits[:, -1, :] / temperature
-            probs = F.softmax(logits, dim=-1)
+            # Low temperature for stable evaluation
+            probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
-            
             ids = torch.cat([ids, next_id], dim=-1)
-            generated_tokens.append(next_id.item())
+            generated.append(next_id.item())
             
-            # Check for stop token
-            current_text = enc.decode(generated_tokens)
-            if "<|end|>" in current_text:
-                return current_text.replace("<|end|>", "").strip()
+            if "<|end|>" in enc.decode(generated):
+                break
                 
-    return enc.decode(generated_tokens).strip()
+    return enc.decode(generated).replace("<|end|>", "").strip()
 
 # ================= SFT TRAINING LOOP =================
-def get_lr(cfg, step):
-    progress = step / cfg.max_steps
+def get_lr(cfg, global_step):
+    progress = global_step / cfg.total_steps
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 def finetune():
@@ -201,39 +195,48 @@ def finetune():
     
     print(f"Loading Base Knowledge from {cfg.base_model}...")
     model.load_state_dict(torch.load(cfg.base_model, map_location=cfg.device))
-    print("Model Loaded successfully!")
-
+    
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.max_lr, weight_decay=cfg.weight_decay)
-    loader = DataLoader(BPEChatStream(cfg), batch_size=cfg.batch_size)
-    
-    print("\nStarting Supervised Fine-Tuning (SFT) for Chat...")
-    pbar = tqdm(enumerate(loader), total=cfg.max_steps)
-    model.train()
-    
-    for step, batch in pbar:
-        lr = get_lr(cfg, step)
-        for pg in opt.param_groups: pg['lr'] = lr
+    global_step = 0
+
+    for epoch in range(1, cfg.num_epochs + 1):
+        print(f"\n--- Starting SFT Epoch {epoch}/{cfg.num_epochs} ---")
+        loader = DataLoader(BPEChatStream(cfg), batch_size=cfg.batch_size)
+        pbar = tqdm(enumerate(loader), total=cfg.steps_per_epoch)
+        model.train()
+        
+        for step, batch in pbar:
+            lr = get_lr(cfg, global_step)
+            for pg in opt.param_groups: pg['lr'] = lr
+                
+            loss, _ = model(batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device))
+            (loss / cfg.grad_accum).backward()
             
-        loss, _ = model(batch["input_ids"].to(cfg.device), batch["labels"].to(cfg.device))
-        (loss / cfg.grad_accum).backward()
+            if (step + 1) % cfg.grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad()
+            
+            if step % cfg.log_interval == 0: 
+                pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.7f}")
+            
+            global_step += 1
+            if step >= cfg.steps_per_epoch: 
+                break
+
+        # --- END OF EPOCH EVALUATION ---
+        print(f"\n--- Epoch {epoch} Evaluation ---")
+        test_q = "Explain the importance of space exploration."
+        print(f"User: {test_q}")
+        print(f"LNN Assistant: {chat_eval(model, test_q)}")
         
-        if (step + 1) % cfg.grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            opt.zero_grad()
-        
-        if step % cfg.log_interval == 0: 
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
-        
-        if step % cfg.eval_interval == 0 and step > 0:
-            print(f"\n[Test Chat] User: How is the weather today?")
-            print(f"[Test Chat] LNN: {chat_generate(model, 'How is the weather today?')}")
-            model.train()
-        
-        if step >= cfg.max_steps: break
+        # Save per-epoch checkpoint
+        checkpoint_path = f"lnn_assistant_epoch_{epoch}.pt"
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"Checkpoint saved: {checkpoint_path}")
 
     torch.save(model.state_dict(), cfg.output_model)
-    print(f"\nSFT Complete! Assistant saved as {cfg.output_model}")
+    print(f"\nSFT Complete! Final model saved as {cfg.output_model}")
 
 if __name__ == "__main__":
     finetune()
