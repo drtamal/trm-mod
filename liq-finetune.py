@@ -10,8 +10,8 @@ import tiktoken
 # ================= CONFIG (4 EPOCHS / BATCH SIZE 2) =================
 @dataclass
 class SFTConfig:
-    hidden_size: int = 128     
-    num_layers: int = 4        
+    hidden_size: int = 384     
+    num_layers: int = 8        
     num_heads: int = 8         
     max_seq_length: int = 256
     vocab_size: int = 50257    
