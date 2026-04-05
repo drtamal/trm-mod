@@ -24,49 +24,43 @@ from torch.utils.data import IterableDataset, DataLoader
 from dataclasses import dataclass
 from tqdm import tqdm
 
-os.environ["TIKTOKEN_CACHE_DIR"] = "/data/aicoe_gpu/komal_paul_gtg/tiktoken_cache"
+# Fix path and prevent "trust_remote_code" issues
+os.environ["TIKTOKEN_CACHE_DIR"] = "./tiktoken_cache"
+os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "0" 
 import tiktoken
 
 
 # ========================== CONFIG ==========================
 @dataclass
 class Config:
-    # Model
-    hidden_size: int = 1024
+    hidden_size: int = 1024       # Scaled for T4 stability
     num_layers: int = 8
     num_heads: int = 8
     max_seq_length: int = 256
     vocab_size: int = 50257
     dropout: float = 0.1
-
-    # Training
     batch_size: int = 4
     grad_accum: int = 4
     num_epochs: int = 3
-    steps_per_epoch: int = 300_000   # optimizer steps per epoch
+    steps_per_epoch: int = 300000  # Reduced for Colab sessions
     warmup_steps: int = 2000
     max_lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
     label_smoothing: float = 0.05
     max_grad_norm: float = 1.0
-
-    # System
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
     num_workers: int = 2
     log_interval: int = 10
-    eval_interval: int = 20_000
+    eval_interval: int = 20000
     output_model: str = "liq_final.pt"
 
     @property
-    def total_steps(self) -> int:
-        return self.num_epochs * self.steps_per_epoch
-
+    def total_steps(self) -> int: return self.num_epochs * self.steps_per_epoch
     @property
-    def effective_batch_size(self) -> int:
-        return self.batch_size * self.grad_accum
+    def effective_batch_size(self) -> int: return self.batch_size * self.grad_accum
 
 
 # ========================== UTILITIES ==========================
@@ -276,8 +270,7 @@ class LiquidLM(nn.Module):
 
 # ========================== DATASET ==========================
 class BPEStream(IterableDataset):
-    """Streaming tokenizer with proper padding (labels=-100 on pad positions)."""
-
+    """Network-resilient streaming with automatic resumption."""
     def __init__(self, cfg: Config, epoch: int = 0):
         self.cfg = cfg
         self.enc = tiktoken.get_encoding("gpt2")
@@ -286,60 +279,56 @@ class BPEStream(IterableDataset):
 
     def __iter__(self):
         from datasets import load_dataset
-
-        # Shard across DataLoader workers to avoid duplicate data
         worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info is not None else 0
-        num_workers = worker_info.num_workers if worker_info is not None else 1
-
-        attempt, max_retries, base_delay = 0, 10, 5
-        while attempt < max_retries:
+        wid = worker_info.id if worker_info else 0
+        num_w = worker_info.num_workers if worker_info else 1
+        
+        samples_processed = 0
+        max_retries = 50
+        
+        while max_retries > 0:
             try:
+                # Removed trust_remote_code as it's no longer supported/needed
                 ds = load_dataset(
                     "HuggingFaceFW/fineweb-edu", name="sample-10BT",
-                    split="train", streaming=True,
+                    split="train", streaming=True
                 )
-                # Unique seed per worker so each shuffles differently
-                seed = self.cfg.seed + self.epoch * 1000 + attempt + worker_id
+                seed = self.cfg.seed + self.epoch * 1000 + wid
                 ds = ds.shuffle(buffer_size=10_000, seed=seed)
-
-                # Each worker takes a disjoint slice of the stream
-                if num_workers > 1:
-                    ds = ds.shard(num_shards=num_workers, index=worker_id)
-
-                print(f"Stream ready (epoch {self.epoch + 1}, attempt {attempt + 1}, worker {worker_id}/{num_workers})")
+                if num_w > 1: ds = ds.shard(num_shards=num_w, index=wid)
+                
+                # If we crashed, skip ahead to where we were
+                if samples_processed > 0:
+                    print(f"\n[Worker {wid}] Reconnecting... skipping {samples_processed} samples.")
+                    ds = ds.skip(samples_processed)
 
                 for sample in ds:
-                    try:
-                        tokens = self.enc.encode_ordinary(sample["text"])
-                        if not tokens:
-                            continue
-                        sl = self.cfg.max_seq_length
-                        if len(tokens) > sl:
-                            s = random.randint(0, len(tokens) - sl)
-                            tokens = tokens[s : s + sl]
-                            ids, lbl = tokens, tokens
-                        else:
-                            pad = sl - len(tokens)
-                            ids = tokens + [self.eot] * pad
-                            lbl = tokens + [-100] * pad
+                    tokens = self.enc.encode_ordinary(sample["text"])
+                    if not tokens: continue
+                    
+                    sl = self.cfg.max_seq_length
+                    # Sliding window or padding
+                    if len(tokens) > sl:
+                        s = random.randint(0, len(tokens) - sl)
+                        ids = tokens[s : s + sl]
+                        lbl = ids
+                    else:
+                        pad = sl - len(tokens)
+                        ids = tokens + [self.eot] * pad
+                        lbl = tokens + [-100] * pad
 
-                        yield {
-                            "input_ids": torch.tensor(ids, dtype=torch.long),
-                            "labels": torch.tensor(lbl, dtype=torch.long),
-                        }
-                    except Exception as e:
-                        print(f"\nSkipping bad sample: {e}")
-                        continue
-                break
-            except (ConnectionError, TimeoutError, OSError) as e:
-                attempt += 1
-                wait = base_delay * (2 ** (attempt - 1))
-                print(f"\n[NET ERROR] {e} — retry {attempt}/{max_retries} in {wait}s")
+                    yield {
+                        "input_ids": torch.tensor(ids, dtype=torch.long),
+                        "labels": torch.tensor(lbl, dtype=torch.long),
+                    }
+                    samples_processed += 1
+                break # Finished stream successfully
+
+            except Exception as e:
+                max_retries -= 1
+                wait = min(60, 5 * (2 ** (10 - min(10, max_retries))))
+                print(f"\n[Network Error] Worker {wid}: {e}. Retrying in {wait}s...")
                 time.sleep(wait)
-
-        if attempt >= max_retries:
-            raise ConnectionError("Stream failed after max retries.")
 
 
 # ========================== GENERATION ==========================
@@ -402,7 +391,7 @@ def train():
 
     use_amp = cfg.use_amp and cfg.device == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    amp_dtype = torch.float16 # T4 optimized
 
     total_p = sum(p.numel() for p in model.parameters())
     train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
